@@ -1,0 +1,22 @@
+﻿  Building 'xfz1986_usb_graphic' with toolset 'WindowsUserModeDriver10.0' and the 'Universal' target platform.
+  Stamping x64\Debug\xfz1986_usb_graphic.inf
+  Stamping [Version] section with DriverVer=01/25/2026,1.2.25.2
+C:\Users\Administrator\Desktop\usbscreen\win10_idd_driver\idd_xfz1986_usb_graphic\xfz1986_usb_graphic.inf(29-29): warning 2084: Service binary 'C:\Windows\System32\drivers\WUDFRd.sys' should reference a CopyFiles destination file.
+    正在创建库 C:\Users\Administrator\Desktop\usbscreen\win10_idd_driver\x64\Debug\xfz1986_usb_graphic.lib 和对象 C:\Users\Administrator\Desktop\usbscreen\win10_idd_driver\x64\Debug\xfz1986_usb_graphic.exp
+  idd_xfz1986_usb_graphic.vcxproj -> C:\Users\Administrator\Desktop\usbscreen\win10_idd_driver\x64\Debug\xfz1986_usb_graphic.dll
+  Driver is 'Universal'.
+  ........................
+  Signability test complete.
+  
+  Errors:
+  None
+  
+  Warnings:
+  None
+  
+  Catalog generation complete.
+  C:\Users\Administrator\Desktop\usbscreen\win10_idd_driver\x64\Debug\xfz1986_usb_graphic\xfz1986_usb_graphic.cat
+  Set catalog attribute.
+  WdkVersion: 10.0.26100.0
+  Set catalog attribute.
+  WdkAssemblyVersion: 10.0.26100.6584

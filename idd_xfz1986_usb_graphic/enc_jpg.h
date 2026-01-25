@@ -1,6 +1,5 @@
 
 #include"enc_base.h"
-#include"tiny_jpeg.h"
 
 
 

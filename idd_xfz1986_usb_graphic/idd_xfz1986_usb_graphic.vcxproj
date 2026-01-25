@@ -328,7 +328,6 @@
     <ClInclude Include="enc_jpg.h" />
     <ClInclude Include="log.h" />
     <ClInclude Include="resource.h" />
-    <ClInclude Include="tiny_jpeg.h" />
     <ClInclude Include="Trace.h" />
   </ItemGroup>
   <ItemGroup>
@@ -336,7 +335,6 @@
     <ClCompile Include="enc_base.cpp" />
     <ClCompile Include="enc_jpg.cpp" />
     <ClCompile Include="enc_raw_rgb.cpp" />
-    <ClCompile Include="tiny_jpeg.c" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="Resource.rc" />

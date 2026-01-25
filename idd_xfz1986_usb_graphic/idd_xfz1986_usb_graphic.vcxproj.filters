@@ -28,9 +28,6 @@
     <ClInclude Include="Trace.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="tiny_jpeg.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="log.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -49,9 +46,6 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Driver.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="tiny_jpeg.c">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="enc_base.cpp">

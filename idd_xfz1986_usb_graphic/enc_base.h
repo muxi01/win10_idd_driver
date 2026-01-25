@@ -26,7 +26,7 @@ PACK(
 #define UDISP_TYPE_RGB565  0
 #define UDISP_TYPE_RGB888  1
 #define UDISP_TYPE_YUV420  2
-#define UDISP_TYPE_JPG		3
+#define UDISP_TYPE_JPG	   3
 
 
 typedef struct _udisp_frame_header_t {  //16bytes
@@ -43,19 +43,19 @@ typedef struct _udisp_frame_header_t {  //16bytes
 
 
 class enc_base{
-	
+
 public:
 
 	static int disp_setup_frame_header(uint8_t * msg, int x, int y, int right, int bottom, uint8_t op_flg ,uint32_t total);
 	int enc_header(uint8_t * enc,int x, int y, int right, int bottom, int total_bytes){
-			
+	
 		disp_setup_frame_header(enc, x, y, right, bottom, this->enc_type, total_bytes);
 		return 0;
-		};
+	};
 	virtual int enc( uint8_t * enc, uint8_t * src,int x, int y, int right, int bottom, int line_width,int limit)=0;
 
 protected :
-		uint8_t enc_type;
+	uint8_t enc_type;
 	
 };
 

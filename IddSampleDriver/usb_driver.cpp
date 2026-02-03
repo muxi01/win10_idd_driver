@@ -9,6 +9,7 @@ WDF_DECLARE_CONTEXT_TYPE(IndirectDeviceContextWrapper);
 
 // Global error counter for USB
 static usb_connection_state_t g_usb_state = USB_STATE_DISCONNECTED;
+static volatile LONG g_usb_init_flag = 0;
 static WDFWAITLOCK g_usb_state_lock = NULL;
 
 #define LOG_DEBUG()  LOGI("%s.%d\n",__func__,__LINE__)
@@ -271,6 +272,7 @@ int usb_resouce_init(SLIST_HEADER* urb_list, int width, int height)
         InterlockedPushEntrySList(urb_list, &(purb->node));
         LOGD("Created URB item %d: urb_msg=%p, size=%d, wdfMemory=%p\n",purb->id, purb->urb_msg, purb->urb_msg_size, purb->wdfMemory);
     }
+    g_usb_init_flag = 1;
     return 0;
 }
 
@@ -306,13 +308,14 @@ int usb_resouce_distory(SLIST_HEADER* urb_list)
         }
         _aligned_free(purb);
     }
+    g_usb_init_flag =0;
     return 0;
 }
 
 NTSTATUS usb_device_connect(WDFDEVICE Device)
 {
     NTSTATUS status;
-    if(g_usb_state_lock !=NULL) {
+    if(g_usb_init_flag > 0) {
         // Re-select interfaces
         status = usb_select_interface(Device);
         if (!NT_SUCCESS(status)) {
@@ -333,7 +336,7 @@ NTSTATUS usb_device_disconnect(WDFDEVICE Device)
 {
     UNREFERENCED_PARAMETER(Device);
     // Update USB state
-    if(g_usb_state_lock !=NULL) {
+    if(g_usb_init_flag > 0) {
         WdfWaitLockAcquire(g_usb_state_lock, NULL);
         g_usb_state = USB_STATE_DISCONNECTED;
         WdfWaitLockRelease(g_usb_state_lock);
@@ -346,7 +349,7 @@ BOOLEAN usb_is_connected(WDFDEVICE Device)
 {
     UNREFERENCED_PARAMETER(Device);
     usb_connection_state_t state;
-    if(g_usb_state_lock !=NULL) {
+    if(g_usb_init_flag > 0) {
         WdfWaitLockAcquire(g_usb_state_lock, NULL);
         state = g_usb_state;
         WdfWaitLockRelease(g_usb_state_lock);

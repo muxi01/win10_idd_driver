@@ -175,69 +175,132 @@ void tools_parse_usb_dev_info(char* str, usb_dev_config_t* config)
     config->debug =debug_level= LOG_LEVEL_INFO;
     config->sleep = 5;
 #if 1
-    // Parse configuration items
-    for (int i = 0; i < cnt; i++) {
-        char* item_str = cfg[i].str;
-        LOGD("%d %s\n", i, item_str);
+    if (cfg[0].str[0] == 'U') {
+        // Parse configuration items
+        for (int i = 0; i < cnt; i++) {
+            char* item_str = cfg[i].str;
+            LOGD("%d %s\n", i, item_str);
 
-        switch (item_str[0]) {
-        case 'U': {
-            int reg_id;
-            if (sscanf_s(item_str, "U%d", &reg_id) == 1) {
-                config->reg_idx = reg_id;
-                LOGI("udisp reg idx:%d\n", config->reg_idx);
-            }
-        }
-        break;
-
-        case 'D': {
-            int debug,sleep;
-            if (sscanf_s(item_str, "D%dx%d", &debug,&sleep) == 2) {
-                debug_level = debug;
-                config->sleep = sleep;
-                config->debug = debug;
-                LOGI("udisp debug:%d sleep %d\n", debug,sleep);
-            }
-        }
-        break;
-        case 'R': {
-            int w = 0, h = 0,fps=0;
-            if (sscanf_s(item_str, "R%dx%dx%d", &w, &h,&fps) == 3) {
-                config->width = w;
-                config->height = h;
-                config->fps = fps;
-                LOGI("udisp width:%d height:%d fps%d\n",w,h,fps);
-            }  
-        }
-        break;
-        case 'E':{
-            int encode,quelity;
-            if (sscanf_s(item_str, "E%dx%d", &encode,&quelity) == 2) {
-                if(encode <= IMAGE_TYPE_JPG) {
-                    if(encode ==0) {
-                        config->img_type =IMAGE_TYPE_RGB565;
-                    }
-                    else if(encode ==1) {
-                        config->img_type = IMAGE_TYPE_RGB888;
-                    }
-                    else if(encode == 2) {
-                        config->img_type = IMAGE_TYPE_YUV420;
-                    }
-                    else if(encode == 3) {
-                        config->img_type = IMAGE_TYPE_JPG;
-                    }
-                    config->img_qlt = quelity;
-                    LOGI("Encode type:%d quality:%d\n", encode, quelity);
+            switch (item_str[0]) {
+            case 'U': {
+                int reg_id;
+                if (sscanf_s(item_str, "U%d", &reg_id) == 1) {
+                    config->reg_idx = reg_id;
+                    LOGI("udisp reg idx:%d\n", config->reg_idx);
                 }
             }
-        }
-        break;
+            break;
 
-        default:
-            LOGW("Unknown encoder type '%c', using JPEG default\n", item_str[1]);
-        break;
+            case 'D': {
+                int debug,sleep;
+                if (sscanf_s(item_str, "D%dx%d", &debug,&sleep) == 2) {
+                    debug_level = debug;
+                    config->sleep = sleep;
+                    config->debug = debug;
+                    LOGI("udisp debug:%d sleep %d\n", debug,sleep);
+                }
+            }
+            break;
+            case 'R': {
+                int w = 0, h = 0,fps=0;
+                if (sscanf_s(item_str, "R%dx%dx%d", &w, &h,&fps) == 3) {
+                    config->width = w;
+                    config->height = h;
+                    config->fps = fps;
+                    LOGI("udisp width:%d height:%d fps%d\n",w,h,fps);
+                }  
+            }
+            break;
+            case 'E':{
+                int encode,quelity;
+                if (sscanf_s(item_str, "E%dx%d", &encode,&quelity) == 2) {
+                    if(encode <= IMAGE_TYPE_JPG) {
+                        if(encode ==0) {
+                            config->img_type =IMAGE_TYPE_RGB565;
+                        }
+                        else if(encode ==1) {
+                            config->img_type = IMAGE_TYPE_RGB888;
+                        }
+                        else if(encode == 2) {
+                            config->img_type = IMAGE_TYPE_YUV420;
+                        }
+                        else if(encode == 3) {
+                            config->img_type = IMAGE_TYPE_JPG;
+                        }
+                        config->img_qlt = quelity;
+                        LOGI("Encode type:%d quality:%d\n", encode, quelity);
+                    }
+                }
+            }
+            break;
+
+            default:
+                LOGW("Unknown encoder type '%c', using JPEG default\n", item_str[1]);
+            break;
+            }
         }
     }
+    else {
+        int t;
+        for(int i=0;i<cnt;i++){
+            char * str=cfg[i].str;
+            LOGD("%d %s\n",i,str);
+            switch(str[0])
+            {
+            case 'B':
+                break;
+            case 'R':
+                int w,h;
+                t=sscanf(str,"R%dx%d",&w,&h);
+                if(t == 2){
+                    config->width =w;
+                    config->height=h;
+                    LOGI("udisp w%d h%d\n",w, h);
+                }
+                //*w=1024;
+                //*h=600;
+                break;
+            case 'F':
+                int fps;
+                t = sscanf(str, "Fps%d", &fps);
+                if (t == 1) {
+                    config->fps=fps;
+                    LOGI("udisp fps%d\n", fps);
+                }
+                //*fps=60;
+                break;
+            case 'E':
+                int quality;
+                switch(str[1]){
+                    case 'j':
+                        t=sscanf(str,"Ejpg%d",&quality);
+                        if(t==1){
+                            config->img_type = IMAGE_TYPE_JPG;
+                            config->img_qlt = quality;
+                        }
+                        break;
+                    case 'r':
+                        t=sscanf(str,"Ergb%d",&quality);
+                        if(t==1){
+                            if(quality ==16 ){
+                                config->img_type = IMAGE_TYPE_RGB565;
+                            }else if (quality == 32)
+                                {
+                                config->img_type = IMAGE_TYPE_RGB888;
+                            }
+                        }
+                        break;
+                    default:
+                        break;
+                }
+                break;
+            default:
+                break;
+            }
+        }
+    }
+
+    
 #endif 
     LOGI("Parsed USB config: w=%d h=%d enc=%d quality=%d fps=%d\n", 
         config->width, config->height, config->img_type,config->img_qlt, config->fps);

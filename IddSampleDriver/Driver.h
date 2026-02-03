@@ -19,7 +19,7 @@
 #include <wdf.h>
 #include <wdfusb.h>
 #include "Trace.h"
-#include "image_encoder.h"
+#include "encoder.h"
 #include "basetype.h"
 
 
@@ -74,8 +74,7 @@ namespace Microsoft
             static DWORD CALLBACK RunThread(LPVOID Argument);
 
             void Run();
-            void RunCore();
-            void decision_runtime_encoder(WDFDEVICE Device);
+            void main_function();
 
         public:
             IDDCX_SWAPCHAIN m_hSwapChain;
@@ -83,7 +82,7 @@ namespace Microsoft
             WDFDEVICE  mp_WdfDevice;
             uint8_t		fb_buf[DISP_MAX_HEIGHT*DISP_MAX_WIDTH*4];
 
-            image_encoder_t * encoder;
+            ImageEncoder *m_pEncoder;
             SLIST_HEADER urb_list;
             int max_out_pkg_size;
 
@@ -134,11 +133,13 @@ typedef struct{
 typedef struct {
     int w;
     int h;
-    int enc;
-    int quality;
+    int img_type;
+    int img_qlt;
     int fps;
     int blimit;
-    int dbg_mode;
+    int sample_only;
+    int debug_level;
+    int sleep;
 } display_config_t;
 
 class IndirectDeviceContextWrapper {
@@ -160,7 +161,7 @@ public:
 	config_cstr_t udisp_registry_dev_info;
 	config_cstr_t udisp_dev_info;
 	TCHAR   tchar_udisp_devinfo[UDISP_CONFIG_STR_LEN];
-	display_config_t display_config;
+	display_config_t config;
 
     // Error recovery state
     usb_connection_state_t usb_state;

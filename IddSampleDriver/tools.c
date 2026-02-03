@@ -2,8 +2,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include "basetype.h"
 #include "tools.h"
-#include "image_encoder.h"
 
 // Missing constants from Driver.h and usb_driver.h
 #define UDISP_CONFIG_STR_LEN  256
@@ -102,21 +102,21 @@ void tools_perf_stats_print(perf_stats_t* stats)
 {
     if (stats == NULL) return;
 
-    LOGI("=== Performance Statistics ===\n");
-    LOGI("Total frames: %llu\n", stats->total_frames);
-    LOGI("Dropped frames: %llu\n", stats->dropped_frames);
-    LOGI("Error frames: %llu\n", stats->error_frames);
-    LOGI("Total bytes: %llu MB\n", stats->total_bytes / (1024 * 1024));
-    LOGI("URBs sent: %llu\n", stats->urbs_sent);
-    LOGI("URBs failed: %llu\n", stats->urbs_failed);
-    LOGI("Avg grab time: %lld us\n", stats->avg_grab_time_us);
-    LOGI("Avg encode time: %lld us\n", stats->avg_encode_time_us);
-    LOGI("Avg send time: %lld us\n", stats->avg_send_time_us);
-    LOGI("Avg total time: %lld us\n", stats->avg_total_time_us);
+    LOGW("=== Performance Statistics ===\n");
+    LOGW("Total frames: %llu\n", stats->total_frames);
+    LOGW("Dropped frames: %llu\n", stats->dropped_frames);
+    LOGW("Error frames: %llu\n", stats->error_frames);
+    LOGW("Total bytes: %llu MB\n", stats->total_bytes / (1024 * 1024));
+    LOGW("URBs sent: %llu\n", stats->urbs_sent);
+    LOGW("URBs failed: %llu\n", stats->urbs_failed);
+    LOGW("Avg grab time: %lld us\n", stats->avg_grab_time_us);
+    LOGW("Avg encode time: %lld us\n", stats->avg_encode_time_us);
+    LOGW("Avg send time: %lld us\n", stats->avg_send_time_us);
+    LOGW("Avg total time: %lld us\n", stats->avg_total_time_us);
 
     if (stats->total_frames > 0) {
         const float success_rate = (float)(stats->total_frames - stats->error_frames) / stats->total_frames * 100;
-        LOGI("Success rate: %.2f%%\n", success_rate);
+        LOGW("Success rate: %.2f%%\n", success_rate);
     }
 }
 
@@ -126,14 +126,6 @@ void tools_perf_stats_reset(perf_stats_t* stats)
     tools_perf_stats_init(stats);
 }
 
-static int tools_parse_int_value(const char* str, const char* prefix)
-{
-    int value = 0;
-    if (sscanf_s(str, prefix, &value) == 1) {
-        return value;
-    }
-    return -1;
-}
 
 int tools_split_config_str(char* str, usb_info_item_t* cfg, int max)
 {
@@ -162,111 +154,91 @@ int tools_split_config_str(char* str, usb_info_item_t* cfg, int max)
 void tools_parse_usb_dev_info(char* str, usb_dev_config_t* config)
 {
     usb_info_item_t cfg[USB_INFO_CFG_MAX] = { 0 };
-    int cnt = 0, i;
-    int enc_configured = 0;
 
     if (str == NULL || config == NULL) {
         return;
     }
 
-    cnt = tools_split_config_str(str, cfg, USB_INFO_CFG_MAX);
+    int cnt = tools_split_config_str(str, cfg, USB_INFO_CFG_MAX);
 
     if (cnt < 2) {
-        LOGW("%s [%d] dev info string violation xfz1986 udisp SPEC, using default\n", str, cnt);
+        LOGW("%s [%d] dev info is not recognized, using default\n", str, cnt);
     }
 
     // Set default values
     config->reg_idx = 0;
-    config->width = 0;
-    config->height = 0;
-    config->fps = 60;
-    config->enc_type = IMAGE_TYPE_JPG;
-    config->quality = 5;
-    config->blimit = 1920 * 1080 * 4;
-
-    // Parse register index (last digit of first item)
-    int len = (int)strlen(cfg[0].str);
-    if (len > 0 && isdigit(cfg[0].str[len - 1])) {
-        sscanf_s(&cfg[0].str[len - 1], "%d", &config->reg_idx);
-        LOGI("udisp reg idx:%d\n", config->reg_idx);
-    }
-
+    config->width = 800;
+    config->height =480;
+    config->fps = 30;
+    config->img_type = IMAGE_TYPE_JPG;
+    config->img_qlt = 5;
+    config->debug =debug_level= LOG_LEVEL_INFO;
+    config->sleep = 5;
+#if 1
     // Parse configuration items
-    for (i = 1; i < cnt; i++) {
+    for (int i = 0; i < cnt; i++) {
         char* item_str = cfg[i].str;
         LOGD("%d %s\n", i, item_str);
 
         switch (item_str[0]) {
-        case 'B': {
-            int blimit = tools_parse_int_value(item_str, "Bl%d");
-            if (blimit > 0) {
-                config->blimit = blimit * 1024;
-                LOGI("blimit:%d\n", config->blimit);
+        case 'U': {
+            int reg_id;
+            if (sscanf_s(item_str, "U%d", &reg_id) == 1) {
+                config->reg_idx = reg_id;
+                LOGI("udisp reg idx:%d\n", config->reg_idx);
             }
-            break;
         }
+        break;
+
+        case 'D': {
+            int debug,sleep;
+            if (sscanf_s(item_str, "D%dx%d", &debug,&sleep) == 2) {
+                debug_level = debug;
+                config->sleep = sleep;
+                config->debug = debug;
+                LOGI("udisp debug:%d sleep %d\n", debug,sleep);
+            }
+        }
+        break;
         case 'R': {
-            int w = 0, h = 0;
-            if (sscanf_s(item_str, "R%dx%d", &w, &h) == 2) {
+            int w = 0, h = 0,fps=0;
+            if (sscanf_s(item_str, "R%dx%dx%d", &w, &h,&fps) == 3) {
                 config->width = w;
                 config->height = h;
-                LOGI("udisp w%d h%d\n", config->width, config->height);
-            }
-            break;
-        }
-        case 'F': {
-            int fps = tools_parse_int_value(item_str, "Fps%d");
-            if (fps > 0) {
                 config->fps = fps;
-                LOGI("udisp fps%d\n", config->fps);
-            }
-            break;
+                LOGI("udisp width:%d height:%d fps%d\n",w,h,fps);
+            }  
         }
-        case 'E':
-            if (enc_configured) {
-                break;
-            }
-            switch (item_str[1]) {
-            case 'j': {
-                int quality = tools_parse_int_value(item_str, "Ejpg%d");
-                if (quality > 0) {
-                    config->enc_type = IMAGE_TYPE_JPG;
-                    config->quality = quality;
-                    enc_configured++;
-                    LOGI("enc:%d quality:%d\n", config->enc_type, config->quality);
+        break;
+        case 'E':{
+            int encode,quelity;
+            if (sscanf_s(item_str, "E%dx%d", &encode,&quelity) == 2) {
+                if(encode <= IMAGE_TYPE_JPG) {
+                    if(encode ==0) {
+                        config->img_type =IMAGE_TYPE_RGB565;
+                    }
+                    else if(encode ==1) {
+                        config->img_type = IMAGE_TYPE_RGB888;
+                    }
+                    else if(encode == 2) {
+                        config->img_type = IMAGE_TYPE_YUV420;
+                    }
+                    else if(encode == 3) {
+                        config->img_type = IMAGE_TYPE_JPG;
+                    }
+                    config->img_qlt = quelity;
+                    LOGI("Encode type:%d quality:%d\n", encode, quelity);
                 }
-                break;
             }
-            case 'r': {
-                int quality = tools_parse_int_value(item_str, "Ergb%d");
-                if (quality == 16) {
-                    config->enc_type = IMAGE_TYPE_RGB565;
-                    config->quality = quality;
-                    enc_configured++;
-                    LOGI("enc:%d quality:%d\n", config->enc_type, config->quality);
-                } else if (quality == 32) {
-                    config->enc_type = IMAGE_TYPE_RGB888;
-                    config->quality = quality;
-                    enc_configured++;
-                    LOGI("enc:%d quality:%d\n", config->enc_type, config->quality);
-                } else {
-                    config->enc_type = IMAGE_TYPE_RGB888;
-                    LOGW("Unknown RGB quality %d, using RGB888\n", quality);
-                }
-                break;
-            }
-            default:
-                LOGW("Unknown encoder type '%c', using JPEG default\n", item_str[1]);
-                break;
-            }
-            break;
+        }
+        break;
+
         default:
-            LOGD("Unknown config item: %s\n", item_str);
-            break;
+            LOGW("Unknown encoder type '%c', using JPEG default\n", item_str[1]);
+        break;
         }
     }
-
-    LOGI("Parsed USB config: w=%d h=%d enc=%d quality=%d fps=%d blimit=%d\n",
-         config->width, config->height, config->enc_type,
-         config->quality, config->fps, config->blimit);
+#endif 
+    LOGI("Parsed USB config: w=%d h=%d enc=%d quality=%d fps=%d\n", 
+        config->width, config->height, config->img_type,config->img_qlt, config->fps);
 }

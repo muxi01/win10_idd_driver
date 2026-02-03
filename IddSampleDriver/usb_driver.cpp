@@ -1,15 +1,18 @@
 #include "Driver.h"
 #include "usb_driver.h"
 #include "tools.h"
+#include "encoder.h"
 #include <wdfusb.h>
 
 // Declare context access macro for IndirectDeviceContextWrapper
 WDF_DECLARE_CONTEXT_TYPE(IndirectDeviceContextWrapper);
 
 // Global error counter for USB
-static LONG g_usb_error_count = 0;
 static usb_connection_state_t g_usb_state = USB_STATE_DISCONNECTED;
-static WDFWAITLOCK g_usb_state_lock;
+static WDFWAITLOCK g_usb_state_lock = NULL;
+
+#define LOG_DEBUG()  LOGI("%s.%d\n",__func__,__LINE__)
+
 
 static VOID EvtRequestWriteCompletionRoutine(
     WDFREQUEST Request,
@@ -32,86 +35,60 @@ static VOID EvtRequestWriteCompletionRoutine(
     if (!NT_SUCCESS(status)) {
         LOGE("Write failed: request Status 0x%x UsbdStatus 0x%x\n",
              status, usbCompletionParams->UsbdStatus);
-
-        // Increment global error counter
-        InterlockedIncrement(&g_usb_error_count);
-
-        // Update USB state if error threshold reached
-        if (g_usb_error_count >= USB_ERROR_RESET_THRESHOLD) {
-            WdfWaitLockAcquire(g_usb_state_lock, NULL);
-            g_usb_state = USB_STATE_ERROR;
-            WdfWaitLockRelease(g_usb_state_lock);
-            LOGE("USB error threshold reached, state set to ERROR\n");
-        }
-    } else {
-        // Reset error counter on success
-        if (g_usb_error_count > 0) {
-            InterlockedExchange(&g_usb_error_count, 0);
-        }
     }
 
-    if (urb->wdfMemory != NULL) {
-        WdfObjectDelete(urb->wdfMemory);
-        urb->wdfMemory = NULL;
-    }
-
-    LOGD("pipe:%p cpl urb id:%d\n", urb->pipe, urb->id);
     InterlockedPushEntrySList(urb->urb_list, &(urb->node));
+    LOGI("insert URB id=%d to list, bytesWritten=%d\n", urb->id, bytesWritten);
 }
 
-NTSTATUS usb_send_msg_async(urb_item_t* urb, WDFUSBPIPE pipe, WDFREQUEST Request, PUCHAR msg, int tsize)
+NTSTATUS usb_send_data_async(urb_item_t* urb, WDFUSBPIPE pipe, int tsize)
 {
-    WDFMEMORY wdfMemory;
     NTSTATUS status;
+    WDFREQUEST Request = urb->Request;
+    PUCHAR msg = urb->urb_msg;
 
-    // Check USB state before sending
-    WdfWaitLockAcquire(g_usb_state_lock, NULL);
-    usb_connection_state_t current_state = g_usb_state;
-    WdfWaitLockRelease(g_usb_state_lock);
-
-    if (current_state != USB_STATE_CONNECTED) {
-        LOGW("USB not in connected state (state=%d), skipping send\n", current_state);
-        return STATUS_DEVICE_NOT_READY;
+    // Validate buffer size
+    if (urb->wdfMemory == NULL) {
+        LOGE("URB wdfMemory is NULL for URB id=%d\n", urb->id);
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
-    status = WdfMemoryCreate(
-        WDF_NO_OBJECT_ATTRIBUTES,
-        NonPagedPool,
-        0,
-        tsize,
-        &wdfMemory,
-        NULL);
-
-    if (!NT_SUCCESS(status)) {
-        LOGE("WdfMemoryCreate failed: 0x%x\n", status);
-        return status;
+    if (tsize > urb->urb_msg_size) {
+        LOGE("Transfer size %d exceeds buffer size %d for URB id=%d\n",tsize, urb->urb_msg_size, urb->id);
+        return STATUS_BUFFER_TOO_SMALL;
     }
 
-    WdfMemoryCopyFromBuffer(wdfMemory, 0, msg, tsize);
+    LOG_DEBUG();
+    // Copy to pre-allocated WDF memory
+    WdfMemoryCopyFromBuffer(urb->wdfMemory, 0, msg, tsize);
 
-    status = WdfUsbTargetPipeFormatRequestForWrite(pipe, Request, wdfMemory, NULL);
+    // Reuse and initialize the request before formatting
+    // WdfRequestReuse(Request, STATUS_SUCCESS);
+
+    // Format request for write
+    LOG_DEBUG();
+    status = WdfUsbTargetPipeFormatRequestForWrite(pipe, Request, urb->wdfMemory, NULL);
     if (!NT_SUCCESS(status)) {
         LOGE("WdfUsbTargetPipeFormatRequestForWrite failed: 0x%x\n", status);
-        WdfObjectDelete(wdfMemory);
         return status;
     }
 
     urb->pipe = pipe;
-    urb->wdfMemory = wdfMemory;
-
+    LOG_DEBUG();
     WdfRequestSetCompletionRoutine(Request, EvtRequestWriteCompletionRoutine, urb);
 
+    LOG_DEBUG();
     if (!WdfRequestSend(Request, WdfUsbTargetPipeGetIoTarget(pipe), WDF_NO_SEND_OPTIONS)) {
         status = WdfRequestGetStatus(Request);
-        LOGE("WdfRequestSend failed: 0x%x\n", status);
-        WdfObjectDelete(wdfMemory);
+        LOGE("WdfRequestSend failed: 0x%x, URB id=%d\n", status, urb->id);
         return status;
     }
 
+    LOGI("usb_send_data_async: Request sent successfully, URB id=%d\n", urb->id);
     return STATUS_SUCCESS;
 }
 
-NTSTATUS get_usb_dev_string_info(WDFDEVICE Device, TCHAR* stringBuf)
+NTSTATUS usb_get_discribe_info(WDFDEVICE Device, TCHAR* stringBuf)
 {
     NTSTATUS status;
     USHORT numCharacters = 0;
@@ -159,7 +136,7 @@ NTSTATUS get_usb_dev_string_info(WDFDEVICE Device, TCHAR* stringBuf)
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS SelectInterfaces(WDFDEVICE Device)
+NTSTATUS usb_select_interface(WDFDEVICE Device)
 {
     WDF_USB_DEVICE_SELECT_CONFIG_PARAMS configParams;
     NTSTATUS status = STATUS_SUCCESS;
@@ -167,6 +144,7 @@ NTSTATUS SelectInterfaces(WDFDEVICE Device)
     WDFUSBPIPE pipe;
     WDF_USB_PIPE_INFORMATION pipeInfo;
     WDFUSBINTERFACE usbInterface;
+    UCHAR numInterfaces;
 
     PAGED_CODE();
 
@@ -175,52 +153,54 @@ NTSTATUS SelectInterfaces(WDFDEVICE Device)
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    // Use single interface configuration (interface 0 for Bulk only)
-    WDF_USB_DEVICE_SELECT_CONFIG_PARAMS_INIT_SINGLE_INTERFACE(&configParams);
+    // Scan all interfaces to find Bulk endpoints
+    numInterfaces = WdfUsbTargetDeviceGetNumInterfaces(pDeviceContext->UsbDevice);
+    LOGI("Device has %d interfaces\n", numInterfaces);
 
-    // Get interface 0 (Bulk interface)
-    usbInterface = WdfUsbTargetDeviceGetInterface(pDeviceContext->UsbDevice, 0);
-    if (usbInterface == NULL) {
-        LOGE("Failed to get USB interface 0 (Bulk interface)\n");
-        return STATUS_UNSUCCESSFUL;
-    }
+    pDeviceContext->BulkReadPipe = NULL;
+    pDeviceContext->BulkWritePipe = NULL;
 
-    UCHAR interfaceNumber = WdfUsbInterfaceGetInterfaceNumber(usbInterface);
-    LOGI("Configured USB interface %d for Bulk transfer\n", interfaceNumber);
-
-    configParams.Types.SingleInterface.ConfiguredUsbInterface = usbInterface;
-    configParams.Types.SingleInterface.NumberConfiguredPipes =
-        WdfUsbInterfaceGetNumConfiguredPipes(usbInterface);
-
-    pDeviceContext->UsbInterface = usbInterface;
-
-    const UCHAR numberConfiguredPipes = configParams.Types.SingleInterface.NumberConfiguredPipes;
-    LOGI("Number of configured pipes on interface 0: %d\n", numberConfiguredPipes);
-
-    for (UCHAR index = 0; index < numberConfiguredPipes; index++) {
-        WDF_USB_PIPE_INFORMATION_INIT(&pipeInfo);
-
-        pipe = WdfUsbInterfaceGetConfiguredPipe(pDeviceContext->UsbInterface, index, &pipeInfo);
-        WdfUsbTargetPipeSetNoMaximumPacketSizeCheck(pipe);
-
-        // Log pipe information
-        LOGI("Pipe %d: Type=%d, Direction=%s, Endpoint=0x%02x, MaxPacket=%d\n",
-             index,
-             pipeInfo.PipeType,
-             WdfUsbTargetPipeIsInEndpoint(pipe) ? "IN" : "OUT",
-             pipeInfo.EndpointAddress,
-             pipeInfo.MaximumPacketSize);
-
-        if (pipeInfo.PipeType == WdfUsbPipeTypeBulk && WdfUsbTargetPipeIsInEndpoint(pipe)) {
-            pDeviceContext->BulkReadPipe = pipe;
-            pDeviceContext->max_in_pkg_size = pipeInfo.MaximumPacketSize;
-            LOGI("BulkRead Pipe: 0x%p, max_packet_size: %d\n", pipe, pDeviceContext->max_in_pkg_size);
+    // Scan all interfaces to find Bulk endpoints
+    for (UCHAR ifIndex = 0; ifIndex < numInterfaces; ifIndex++) {
+        usbInterface = WdfUsbTargetDeviceGetInterface(pDeviceContext->UsbDevice, ifIndex);
+        if (usbInterface == NULL) {
+            LOGE("Failed to get USB interface %d\n", ifIndex);
+            continue;
         }
 
-        if (pipeInfo.PipeType == WdfUsbPipeTypeBulk && WdfUsbTargetPipeIsOutEndpoint(pipe)) {
-            pDeviceContext->BulkWritePipe = pipe;
-            pDeviceContext->max_out_pkg_size = pipeInfo.MaximumPacketSize;
-            LOGI("BulkWrite Pipe: 0x%p, max_packet_size: %d\n", pipe, pDeviceContext->max_out_pkg_size);
+        UCHAR interfaceNumber = WdfUsbInterfaceGetInterfaceNumber(usbInterface);
+        UCHAR numPipes = WdfUsbInterfaceGetNumConfiguredPipes(usbInterface);
+        LOGI("Interface %d (bInterfaceNumber=%d): %d pipes\n", ifIndex, interfaceNumber, numPipes);
+
+        // Scan all pipes in this interface
+        for (UCHAR pipeIndex = 0; pipeIndex < numPipes; pipeIndex++) {
+            WDF_USB_PIPE_INFORMATION_INIT(&pipeInfo);
+            pipe = WdfUsbInterfaceGetConfiguredPipe(usbInterface, pipeIndex, &pipeInfo);
+            WdfUsbTargetPipeSetNoMaximumPacketSizeCheck(pipe);
+
+            // Log pipe information
+            LOGI("  Pipe %d: Type=%d, Direction=%s, Endpoint=0x%02x, MaxPacket=%d\n",
+                 pipeIndex,
+                 pipeInfo.PipeType,
+                 WdfUsbTargetPipeIsInEndpoint(pipe) ? "IN" : "OUT",
+                 pipeInfo.EndpointAddress,
+                 pipeInfo.MaximumPacketSize);
+
+            if (pipeInfo.PipeType == WdfUsbPipeTypeBulk && WdfUsbTargetPipeIsInEndpoint(pipe)) {
+                pDeviceContext->BulkReadPipe = pipe;
+                pDeviceContext->max_in_pkg_size = pipeInfo.MaximumPacketSize;
+                pDeviceContext->UsbInterface = usbInterface;
+                LOGI("Found BulkRead Pipe on interface %d: 0x%p, max_packet_size: %d\n",
+                     interfaceNumber, pipe, pDeviceContext->max_in_pkg_size);
+            }
+
+            if (pipeInfo.PipeType == WdfUsbPipeTypeBulk && WdfUsbTargetPipeIsOutEndpoint(pipe)) {
+                pDeviceContext->BulkWritePipe = pipe;
+                pDeviceContext->max_out_pkg_size = pipeInfo.MaximumPacketSize;
+                pDeviceContext->UsbInterface = usbInterface;
+                LOGI("Found BulkWrite Pipe on interface %d: 0x%p, max_packet_size: %d\n",
+                     interfaceNumber, pipe, pDeviceContext->max_out_pkg_size);
+            }
         }
     }
 
@@ -231,16 +211,20 @@ NTSTATUS SelectInterfaces(WDFDEVICE Device)
         return status;
     }
 
-    LOGI("USB interface 0 (Bulk) configured successfully\n");
+    LOGI("USB configured successfully with BulkRead and BulkWrite pipes\n");
     return STATUS_SUCCESS;
 }
 
-int usb_transf_init(SLIST_HEADER* urb_list)
+int usb_resouce_init(SLIST_HEADER* urb_list, int width, int height)
 {
     NTSTATUS status;
 
-    LOGI("%s: Initializing URB list\n", __func__);
+    LOGI("%s: Initializing URB list for %dx%d\n", __func__, width, height);
     InitializeSListHead(urb_list);
+
+    // Calculate buffer size based on screen dimensions
+    int buffer_size = width * height * 4;  // RGB888 = 4 bytes per pixel
+    int max_transfer_size = buffer_size + 128;
 
     // Initialize USB state lock for UMDF
     WDF_OBJECT_ATTRIBUTES attributes;
@@ -251,36 +235,50 @@ int usb_transf_init(SLIST_HEADER* urb_list)
         return -1;
     }
 
-    for (int i = 1; i <= MAX_URB_SIZE; i++) {
-        purb_item_t purb = (urb_item_t*)_aligned_malloc(sizeof(urb_item_t), MEMORY_ALLOCATION_ALIGNMENT);
+    // Set lock initialized flag
+    for (int i = 0; i < MAX_URB_SIZE; i++) {
+
+        urb_item_t* purb = (urb_item_t*)_aligned_malloc(sizeof(urb_item_t), MEMORY_ALLOCATION_ALIGNMENT);
         if (purb == NULL) {
             LOGE("Memory allocation failed for URB item %d\n", i);
-            break;
+            return -2;
         }
 
         status = WdfRequestCreate(WDF_NO_OBJECT_ATTRIBUTES, NULL, &purb->Request);
         if (!NT_SUCCESS(status)) {
             LOGE("WdfRequestCreate failed: 0x%x\n", status);
-            _aligned_free(purb);
-            break;
+            return -3;
         }
 
         purb->id = i;
         purb->urb_list = urb_list;
-        purb->wdfMemory = NULL;
+
+        // Allocate urb_msg buffer
+        purb->urb_msg = (uint8_t*)_aligned_malloc(max_transfer_size, MEMORY_ALLOCATION_ALIGNMENT);
+        if (purb->urb_msg == NULL) {
+            LOGE("Failed to allocate urb_msg for URB %d\n", purb->id);
+            return -4;
+        }
+        purb->urb_msg_size = max_transfer_size;
+
+        // Create pre-allocated WDF memory for USB transfer
+        status = WdfMemoryCreate(WDF_NO_OBJECT_ATTRIBUTES,NonPagedPool,0,max_transfer_size,&purb->wdfMemory,NULL);
+        if (!NT_SUCCESS(status)) {
+            LOGE("WdfMemoryCreate failed for URB %d: 0x%x\n", purb->id, status);
+            return -5;
+        }
 
         InterlockedPushEntrySList(urb_list, &(purb->node));
-        LOGD("Created URB item %d\n", purb->id);
+        LOGD("Created URB item %d: urb_msg=%p, size=%d, wdfMemory=%p\n",purb->id, purb->urb_msg, purb->urb_msg_size, purb->wdfMemory);
     }
-
     return 0;
 }
 
-int usb_transf_exit(SLIST_HEADER* urb_list)
+int usb_resouce_distory(SLIST_HEADER* urb_list)
 {
     LOGD("%s: Cleaning up URB list\n", __func__);
 
-    for (int i = 1; i <= MAX_URB_SIZE; i++) {
+    for (int i = 0; i < MAX_URB_SIZE; i++) {
         PSLIST_ENTRY pentry = InterlockedPopEntrySList(urb_list);
         urb_item_t* purb = (urb_item_t*)pentry;
 
@@ -291,36 +289,42 @@ int usb_transf_exit(SLIST_HEADER* urb_list)
 
         LOGD("Cleaning up URB item id:%d\n", purb->id);
 
+        // Free dynamically allocated urb_msg buffer
+        if (purb->urb_msg != NULL) {
+            _aligned_free(purb->urb_msg);
+            purb->urb_msg = NULL;
+        }
+
+        // Delete pre-allocated WDF memory
+        if (purb->wdfMemory != NULL) {
+            WdfObjectDelete(purb->wdfMemory);
+            purb->wdfMemory = NULL;
+        }
+
         if (purb->Request != NULL) {
             WdfObjectDelete(purb->Request);
         }
-
         _aligned_free(purb);
     }
-
     return 0;
 }
 
 NTSTATUS usb_device_connect(WDFDEVICE Device)
 {
     NTSTATUS status;
-    auto* pDeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
+    if(g_usb_state_lock !=NULL) {
+        // Re-select interfaces
+        status = usb_select_interface(Device);
+        if (!NT_SUCCESS(status)) {
+            LOGE("Failed to select interfaces on reconnect: 0x%x\n", status);
+            return status;
+        }
 
-    LOGI("USB device connect event\n");
+        WdfWaitLockAcquire(g_usb_state_lock, NULL);
+        g_usb_state = USB_STATE_CONNECTED;
+        WdfWaitLockRelease(g_usb_state_lock);
 
-    // Update USB state
-    WdfWaitLockAcquire(g_usb_state_lock, NULL);
-    g_usb_state = USB_STATE_CONNECTED;
-    InterlockedExchange(&g_usb_error_count, 0);
-    WdfWaitLockRelease(g_usb_state_lock);
-
-    // Re-select interfaces
-    status = SelectInterfaces(Device);
-    if (!NT_SUCCESS(status)) {
-        LOGE("Failed to select interfaces on reconnect: 0x%x\n", status);
-        return status;
     }
-
     LOGI("USB device connected successfully\n");
     return STATUS_SUCCESS;
 }
@@ -328,115 +332,25 @@ NTSTATUS usb_device_connect(WDFDEVICE Device)
 NTSTATUS usb_device_disconnect(WDFDEVICE Device)
 {
     UNREFERENCED_PARAMETER(Device);
-
-    LOGI("USB device disconnect event\n");
-
     // Update USB state
-    WdfWaitLockAcquire(g_usb_state_lock, NULL);
-    g_usb_state = USB_STATE_DISCONNECTED;
-    WdfWaitLockRelease(g_usb_state_lock);
-
+    if(g_usb_state_lock !=NULL) {
+        WdfWaitLockAcquire(g_usb_state_lock, NULL);
+        g_usb_state = USB_STATE_DISCONNECTED;
+        WdfWaitLockRelease(g_usb_state_lock);
+    }
     LOGI("USB device disconnected\n");
     return STATUS_SUCCESS;
 }
 
-NTSTATUS usb_device_reset(WDFDEVICE Device)
-{
-    NTSTATUS status;
-    auto* pDeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
-
-    LOGI("USB device reset initiated\n");
-
-    // Update USB state
-    WdfWaitLockAcquire(g_usb_state_lock, NULL);
-    g_usb_state = USB_STATE_RECOVERING;
-    WdfWaitLockRelease(g_usb_state_lock);
-
-    // Reset USB pipe
-    if (pDeviceContext->BulkWritePipe != NULL) {
-        status = WdfUsbTargetPipeAbortSynchronously(pDeviceContext->BulkWritePipe,
-                                                      WDF_NO_HANDLE, NULL);
-        if (!NT_SUCCESS(status)) {
-            LOGW("Failed to abort write pipe: 0x%x\n", status);
-        }
-
-        status = WdfUsbTargetPipeResetSynchronously(pDeviceContext->BulkWritePipe,
-                                                     WDF_NO_HANDLE, NULL);
-        if (!NT_SUCCESS(status)) {
-            LOGE("Failed to reset write pipe: 0x%x\n", status);
-        }
-    }
-
-    if (pDeviceContext->BulkReadPipe != NULL) {
-        status = WdfUsbTargetPipeAbortSynchronously(pDeviceContext->BulkReadPipe,
-                                                      WDF_NO_HANDLE, NULL);
-        if (!NT_SUCCESS(status)) {
-            LOGW("Failed to abort read pipe: 0x%x\n", status);
-        }
-
-        status = WdfUsbTargetPipeResetSynchronously(pDeviceContext->BulkReadPipe,
-                                                     WDF_NO_HANDLE, NULL);
-        if (!NT_SUCCESS(status)) {
-            LOGE("Failed to reset read pipe: 0x%x\n", status);
-        }
-    }
-
-    // Reset error counter
-    InterlockedExchange(&g_usb_error_count, 0);
-
-    // Re-select interfaces
-    status = SelectInterfaces(Device);
-    if (NT_SUCCESS(status)) {
-        WdfWaitLockAcquire(g_usb_state_lock, NULL);
-        g_usb_state = USB_STATE_CONNECTED;
-        WdfWaitLockRelease(g_usb_state_lock);
-        LOGI("USB device reset successful\n");
-    } else {
-        WdfWaitLockAcquire(g_usb_state_lock, NULL);
-        g_usb_state = USB_STATE_ERROR;
-        WdfWaitLockRelease(g_usb_state_lock);
-        LOGE("USB device reset failed: 0x%x\n", status);
-    }
-
-    return status;
-}
-
-NTSTATUS usb_error_recovery(WDFDEVICE Device, NTSTATUS error_code)
-{
-    NTSTATUS status = STATUS_SUCCESS;
-    LONG error_count = InterlockedIncrement(&g_usb_error_count);
-
-    LOGE("USB error recovery triggered (error=0x%x, count=%ld)\n", error_code, error_count);
-
-    // Select recovery strategy based on error count
-    if (error_count < MAX_RETRY_COUNT) {
-        LOGI("Recovery strategy: RETRY\n");
-        // Just retry, no action needed
-    } else if (error_count < USB_ERROR_RESET_THRESHOLD) {
-        LOGI("Recovery strategy: RESET\n");
-        status = usb_device_reset(Device);
-    } else {
-        LOGI("Recovery strategy: REINIT\n");
-        status = usb_device_reset(Device);
-        if (!NT_SUCCESS(status)) {
-            LOGE("Failed to recover, device may need manual intervention\n");
-        }
-    }
-
-    return status;
-}
-
-NTSTATUS usb_check_connection_state(WDFDEVICE Device, usb_connection_state_t* state)
+BOOLEAN usb_is_connected(WDFDEVICE Device)
 {
     UNREFERENCED_PARAMETER(Device);
-
-    if (state == NULL) {
-        return STATUS_INVALID_PARAMETER;
+    usb_connection_state_t state;
+    if(g_usb_state_lock !=NULL) {
+        WdfWaitLockAcquire(g_usb_state_lock, NULL);
+        state = g_usb_state;
+        WdfWaitLockRelease(g_usb_state_lock);
+        LOGI("usb state (0=connected 1=disconnected) %d\n",state);
     }
-
-    WdfWaitLockAcquire(g_usb_state_lock, NULL);
-    *state = g_usb_state;
-    WdfWaitLockRelease(g_usb_state_lock);
-
-    return STATUS_SUCCESS;
+    return (state == USB_STATE_CONNECTED);
 }

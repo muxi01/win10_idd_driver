@@ -36,7 +36,7 @@
     <ClInclude Include="usb_driver.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="image_encoder.h">
+    <ClInclude Include="encoder.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="tools.h">
@@ -53,7 +53,7 @@
     <ClCompile Include="tools.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="image_encoder.c">
+    <ClCompile Include="encoder.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

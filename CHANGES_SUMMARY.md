@@ -122,7 +122,7 @@ struct IndirectDeviceContextWrapper {
     int quality;                    // 质量
     int fps;                       // 目标 FPS
     int blimit;                    // 缓冲区限制
-    int dbg_mode;                  // 调试模式
+    int sample_only;                  // 采样模式 不发送数据
 };
 ```
 

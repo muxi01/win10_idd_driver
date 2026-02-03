@@ -20,16 +20,19 @@ typedef uint32_t pixel_type_t;
 #define WAIT_TIMEOUT_MS       16
 #define STATS_PRINT_INTERVAL  100
 
-// Forward declaration for DEFAULT_ENCODER_TYPE
-// (will be defined by image_encoder.h)
-#ifndef DEFAULT_ENCODER_TYPE
-#define DEFAULT_ENCODER_TYPE  1  // IMAGE_TYPE_RGB888
-#endif
+// Default encoder type
+#define IMAGE_TYPE_RGB565  (('R' << 24) | ('G' << 16) | ('B' << 8) | (16 << 0))
+#define IMAGE_TYPE_RGB888  (('R' << 24) | ('G' << 16) | ('B' << 8) | (24 << 0))
+#define IMAGE_TYPE_YUV420  (('Y' << 24) | ('4' << 16) | ('2' << 8) | ('0' << 0))
+#define IMAGE_TYPE_JPG     (('J' << 24) | ('P' << 16) | ('E' << 8) | ('G' << 0))
+#define IMAGE_TYPE_NULL    (('N' << 24) | ('U' << 16) | ('L' << 8) | ('L' << 0))
+
+#define FRAME_MAGIC_ID     (('l' << 24) | ('v' << 16) | ('s' << 8) | ('n' << 0))
 
 // USB device connection state
 typedef enum _usb_connection_state {
-    USB_STATE_DISCONNECTED = 0,
-    USB_STATE_CONNECTED = 1,
+    USB_STATE_CONNECTED = 0,
+    USB_STATE_DISCONNECTED = 1,
     USB_STATE_ERROR = 2,
     USB_STATE_RECOVERING = 3
 } usb_connection_state_t;
@@ -67,8 +70,9 @@ typedef struct _usb_dev_config {
     int reg_idx;      // Register index
     int width;        // Display width
     int height;       // Display height
-    int enc_type;     // Encoding type (0=RGB565, 1=RGB888, 3=JPEG)
-    int quality;      // JPEG quality
+    int img_type;     // Encoding type (0=RGB565, 1=RGB888, 3=JPEG)
+    int img_qlt;      // JPEG quality
     int fps;         // Target FPS
-    int blimit;       // Buffer limit
+    int sleep;         // Sleep time in cycles 
+    int debug;          //debug level
 } usb_dev_config_t;

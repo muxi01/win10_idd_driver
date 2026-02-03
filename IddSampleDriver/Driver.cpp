@@ -18,7 +18,7 @@ Environment:
 #include "Driver.h"
 #include "Driver.tmh"
 #include "usb_driver.h"
-#include "image_encoder.h"
+#include "encoder.h"
 #include "tools.h"
 #include <stdarg.h>
 
@@ -28,10 +28,14 @@ using namespace Microsoft::WRL;
 
 extern "C" DRIVER_INITIALIZE DriverEntry;
 
-LONG debug_level = LOG_LEVEL_INFO;
+LONG debug_level = LOG_LEVEL_TRACE;
+static int g_maxWidth = 1920;
+static int g_maxHeight = 1080;
+
+
 
 VOID registry_config_base(void);
-int enc_grab_surface(std::shared_ptr<Direct3DDevice> m_Device,ComPtr<IDXGIResource> AcquiredBuffer, uint8_t *fb_buf,D3D11_TEXTURE2D_DESC *);
+int fetch_grab_surface(std::shared_ptr<Direct3DDevice> m_Device,ComPtr<IDXGIResource> AcquiredBuffer, uint8_t *fb_buf,D3D11_TEXTURE2D_DESC *);
 
 EVT_WDF_DRIVER_DEVICE_ADD IddSampleDeviceAdd;
 EVT_WDF_DEVICE_D0_ENTRY IddSampleDeviceD0Entry;
@@ -158,16 +162,15 @@ NTSTATUS IddSampleDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
     pContext->purb_list = NULL;
 
     // Set default values
-    pContext->display_config.w = 1920;
-    pContext->display_config.h = 1080;
-    pContext->display_config.enc = IMAGE_TYPE_RGB888;
-    pContext->display_config.quality = 5;
-    pContext->display_config.fps = 60;
-    pContext->display_config.blimit = 1920 * 1080 * 4;
-    pContext->display_config.dbg_mode = 0;
+    pContext->config.w = 1920;
+    pContext->config.h = 1080;
+    pContext->config.img_type = IMAGE_TYPE_JPG;  // Use JPEG for gser streaming
+    pContext->config.img_qlt = 60;  // Better JPEG quality
+    pContext->config.fps = 30;  // Lower FPS for ACM bandwidth
+    pContext->config.sample_only = 0;
+    pContext->config.sleep =0;
 
     // Initialize error recovery and performance tracking
-    pContext->usb_state = USB_STATE_DISCONNECTED;
     tools_perf_stats_init(&pContext->perf_stats);
 
     return Status;
@@ -216,7 +219,7 @@ HRESULT Direct3DDevice::Init()
         return hr;
     }
 
-    // Create a D3D device using the render adapter. BGRA support is required by the WHQL test suite.
+    // Create a D3D device using the render adapter. BGRA support is required by the WHQL test suite.  D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_DEBUG
     hr = D3D11CreateDevice(Adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &Device, nullptr, &DeviceContext);
     if (FAILED(hr))
     {
@@ -237,37 +240,8 @@ void IndirectDeviceContextWrapper::Cleanup()
     delete pContext;
     pContext = nullptr;
 }
-
-void SwapChainProcessor::decision_runtime_encoder(WDFDEVICE Device)
-{
-    auto* pDeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
-
-    LOGI("Creating encoder: type=%d, quality=%d\n", pDeviceContext->display_config.enc, pDeviceContext->display_config.quality);
-
-    switch (pDeviceContext->display_config.enc) {
-        case IMAGE_TYPE_RGB565:
-            encoder = image_encoder_create_rgb565();
-            LOGI("Created RGB565 encoder\n");
-            break;
-
-        case IMAGE_TYPE_RGB888:
-            encoder = image_encoder_create_rgb888();
-            LOGI("Created RGB888 encoder\n");
-            break;
-
-        case IMAGE_TYPE_JPG:
-            encoder = image_encoder_create_jpeg(pDeviceContext->display_config.quality);
-            LOGI("Created JPEG encoder with quality=%d\n", pDeviceContext->display_config.quality);
-            break;
-
-        default:
-            encoder = image_encoder_create_rgb888();
-            LOGW("Unknown encoder type=%d, using RGB888 as default\n", pDeviceContext->display_config.enc);
-            break;
-    }
-}
-
-int enc_grab_surface(std::shared_ptr<Direct3DDevice> m_Device, ComPtr<IDXGIResource> AcquiredBuffer, uint8_t* fb_buf, D3D11_TEXTURE2D_DESC* pframeDescriptor)
+#define  SURFACE_LOG_DEBUG()  do { ; } while (0)
+int fetch_grab_surface(std::shared_ptr<Direct3DDevice> m_Device, ComPtr<IDXGIResource> AcquiredBuffer, uint8_t* fb_buf, D3D11_TEXTURE2D_DESC* pframeDescriptor)
 {
     HRESULT hr;
     ID3D11Texture2D* pAcquiredImage = NULL;
@@ -275,15 +249,17 @@ int enc_grab_surface(std::shared_ptr<Direct3DDevice> m_Device, ComPtr<IDXGIResou
     IDXGISurface* pStagingSurface = NULL;
     int result = -1;
 
+    SURFACE_LOG_DEBUG();
     hr = AcquiredBuffer->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&pAcquiredImage));
     if (FAILED(hr)) {
         LOGE("Failed to query ID3D11Texture2D: 0x%x\n", hr);
         goto cleanup;
     }
-
+    SURFACE_LOG_DEBUG();
     D3D11_TEXTURE2D_DESC srcDesc;
     pAcquiredImage->GetDesc(&srcDesc);
 
+    SURFACE_LOG_DEBUG();
     D3D11_TEXTURE2D_DESC stagingDesc = srcDesc;
     stagingDesc.Usage = D3D11_USAGE_STAGING;
     stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -294,21 +270,24 @@ int enc_grab_surface(std::shared_ptr<Direct3DDevice> m_Device, ComPtr<IDXGIResou
     stagingDesc.SampleDesc.Count = 1;
 
     *pframeDescriptor = stagingDesc;
-
+    SURFACE_LOG_DEBUG();
     hr = m_Device->Device->CreateTexture2D(&stagingDesc, NULL, &pStagingTexture);
     if (FAILED(hr)) {
         LOGE("Failed to create staging texture: 0x%x\n", hr);
         goto cleanup;
     }
 
+    SURFACE_LOG_DEBUG();
     m_Device->DeviceContext->CopyResource(pStagingTexture, pAcquiredImage);
 
+    SURFACE_LOG_DEBUG();
     hr = pStagingTexture->QueryInterface(__uuidof(IDXGISurface), reinterpret_cast<void**>(&pStagingSurface));
     if (FAILED(hr)) {
         LOGE("Failed to query IDXGISurface: 0x%x\n", hr);
         goto cleanup;
     }
 
+    SURFACE_LOG_DEBUG();
     DXGI_MAPPED_RECT mappedRect;
     hr = pStagingSurface->Map(&mappedRect, DXGI_MAP_READ);
     if (FAILED(hr)) {
@@ -316,15 +295,21 @@ int enc_grab_surface(std::shared_ptr<Direct3DDevice> m_Device, ComPtr<IDXGIResou
         goto cleanup;
     }
 
+    SURFACE_LOG_DEBUG();
+    LOGI("fb_buf=%p, pBits=%p, Width=%d, Height=%d, Pitch=%d\n",fb_buf, mappedRect.pBits, stagingDesc.Width, stagingDesc.Height, mappedRect.Pitch);
+
     const int expected_pitch = stagingDesc.Width * 4;
     if (mappedRect.Pitch == expected_pitch) {
+        LOGI("Fast copy path: size=%d\n", stagingDesc.Width * stagingDesc.Height * 4);
         memcpy(fb_buf, mappedRect.pBits, stagingDesc.Width * stagingDesc.Height * 4);
     } else {
+        LOGI("Row-by-row copy: expected_pitch=%d\n", expected_pitch);
         for (UINT i = 0; i < stagingDesc.Height; i++) {
             memcpy(&fb_buf[expected_pitch * i],&mappedRect.pBits[mappedRect.Pitch * i],expected_pitch);
         }
     }
 
+    SURFACE_LOG_DEBUG();
     pStagingSurface->Unmap();
     result = 0;
 
@@ -382,19 +367,16 @@ VOID registry_config_base(void)
 #pragma region SwapChainProcessor
 
 SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, WDFDEVICE WdfDevice, HANDLE NewFrameEvent)
-    : m_hSwapChain(hSwapChain), m_Device(Device), mp_WdfDevice(WdfDevice), m_hAvailableBufferEvent(NewFrameEvent),
-      encoder(nullptr), urb_list{}, max_out_pkg_size(0), fb_buf{}
+    : m_hSwapChain(hSwapChain), m_Device(Device), mp_WdfDevice(WdfDevice), m_hAvailableBufferEvent(NewFrameEvent),m_pEncoder(nullptr), urb_list{}, max_out_pkg_size(0), fb_buf{}
 {
     auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(WdfDevice);
-
-    m_hTerminateEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
-
-    usb_transf_init(&urb_list);
     pContext->purb_list = &urb_list;
-    LOGI("create SwapChainProcessor");
-
+    
+    m_hTerminateEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
     // Immediately create and run the swap-chain processing thread, passing 'this' as the thread parameter
     m_hThread.Attach(CreateThread(nullptr, 0, RunThread, this, 0, nullptr));
+
+    LOGI("create SwapChainProcessor");
 }
 
 SwapChainProcessor::~SwapChainProcessor()
@@ -403,20 +385,12 @@ SwapChainProcessor::~SwapChainProcessor()
     auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(this->mp_WdfDevice);
     SetEvent(m_hTerminateEvent.Get());
     pContext->purb_list = NULL;
-    LOGI("destroy SwapChainProcessor");
-
-    // Clean up encoder
-    if (encoder != NULL) {
-        image_encoder_destroy(encoder);
-        encoder = NULL;
-    }
-
-    usb_transf_exit(&urb_list);
-
+    
     if (m_hThread.Get()) {
         // Wait for the thread to terminate
         WaitForSingleObject(m_hThread.Get(), INFINITE);
     }
+    LOGI("destroy SwapChainProcessor");
 }
 
 DWORD CALLBACK SwapChainProcessor::RunThread(LPVOID Argument)
@@ -433,9 +407,18 @@ void SwapChainProcessor::Run()
 
     HANDLE AvTaskHandle = AvSetMmThreadCharacteristicsW(L"Distribution", &AvTask);
 
-    decision_runtime_encoder(mp_WdfDevice);
-    RunCore();
+    // Initialize USB transfers with screen dimensions from USB config
+    auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(mp_WdfDevice);
 
+    m_pEncoder = new ImageEncoder(pContext->config.img_type, pContext->config.img_qlt);
+    if(usb_resouce_init(&urb_list, pContext->config.w, pContext->config.h) >=0 ) {
+        // Main processing loop
+        main_function();
+    }
+    usb_resouce_distory(&urb_list);
+
+    delete m_pEncoder;
+    m_pEncoder = nullptr;
     // Always delete the swap-chain object when swap-chain processing loop terminates in order to kick the system to
     // provide a new swap-chain if necessary.
     WdfObjectDelete((WDFOBJECT)m_hSwapChain);
@@ -444,7 +427,9 @@ void SwapChainProcessor::Run()
     AvRevertMmThreadCharacteristics(AvTaskHandle);
 }
 
-void SwapChainProcessor::RunCore()
+
+#define MAIN_DEBUG_LOG()  LOGI("%s.%d\n",__func__,__LINE__)
+void SwapChainProcessor::main_function()
 {
     ComPtr<IDXGIDevice> DxgiDevice;
     HRESULT hr = m_Device->Device.As(&DxgiDevice);
@@ -460,36 +445,40 @@ void SwapChainProcessor::RunCore()
 
     hr = IddCxSwapChainSetDevice(m_hSwapChain, &SetDevice);
     if (FAILED(hr)) {
-        LOGE("Failed to set swap-chain device: 0x%x\n", hr);
+        LOGE("Failed to set swap-chain device: error code =0x%x\n", hr);
         return;
     }
 
     // Set USB state to connected
-    usb_device_connect(mp_WdfDevice);
-
-    LOGI("SwapChainProcessor started, FPS target: %d\n", pContext->display_config.fps);
+    NTSTATUS status =usb_device_connect(mp_WdfDevice);
+    if (!NT_SUCCESS(status)) {
+		LOGI("usb_device_connect failed 0x%x\n", status);
+		return ;
+	}
+    LOGI("SwapChainProcessor started, FPS target: %d\n", pContext->config.fps);
 
     // Print performance stats every 100 frames
-    const int stats_print_interval = 100;
-
+    const int stats_print_interval = 1000;
     for (;;) {
+#if 1
         ComPtr<IDXGIResource> AcquiredBuffer;
         IDARG_OUT_RELEASEANDACQUIREBUFFER Buffer = {};
         hr = IddCxSwapChainReleaseAndAcquireBuffer(m_hSwapChain, &Buffer);
-
+        MAIN_DEBUG_LOG();
         if (hr == E_PENDING) {
             HANDLE WaitHandles[] = {
                 m_hAvailableBufferEvent,
                 m_hTerminateEvent.Get()
             };
-
+            MAIN_DEBUG_LOG();
             DWORD WaitResult = WaitForMultipleObjects(ARRAYSIZE(WaitHandles), WaitHandles, FALSE, 16);
 
             if (WaitResult == WAIT_OBJECT_0 || WaitResult == WAIT_TIMEOUT) {
+                MAIN_DEBUG_LOG();
                 continue;
             }
             else if (WaitResult == WAIT_OBJECT_0 + 1) {
-                LOGI("SwapChainProcessor termination requested\n");
+                LOGE("SwapChainProcessor termination requested\n");
                 break;
             }
             else {
@@ -499,65 +488,45 @@ void SwapChainProcessor::RunCore()
             }
         }
         else if (SUCCEEDED(hr)) {
+            MAIN_DEBUG_LOG();
             AcquiredBuffer.Attach(Buffer.MetaData.pSurface);
 
-            if (pContext->display_config.dbg_mode) {
-                LOGD("Frame dropped: dbg_mode=%d\n", pContext->display_config.dbg_mode);
+            if (pContext->config.sample_only) {
+                LOGE("Frame dropped: sample_only=%d\n", pContext->config.sample_only);
                 pContext->perf_stats.dropped_frames++;
                 goto next_frame;
             }
 
             // Check USB state
-            usb_connection_state_t state;
-            usb_check_connection_state(mp_WdfDevice, &state);
-
-            if (state != USB_STATE_CONNECTED) {
-                LOGW("USB not connected (state=%d), frame dropped\n", state);
+            if (!usb_is_connected(mp_WdfDevice)) {
+                LOGE("Usb is disconnected\n");
                 pContext->perf_stats.dropped_frames++;
                 goto next_frame;
             }
 
+            MAIN_DEBUG_LOG();
             PSLIST_ENTRY pentry = InterlockedPopEntrySList(&urb_list);
             urb_item_t* purb = (urb_item_t*)pentry;
-
             if (purb != NULL) {
+                MAIN_DEBUG_LOG();
                 int64_t grab_start = tools_get_time_us();
-
                 D3D11_TEXTURE2D_DESC frameDescriptor;
-                enc_grab_surface(m_Device, AcquiredBuffer, fb_buf, &frameDescriptor);
+                fetch_grab_surface(m_Device, AcquiredBuffer, fb_buf, &frameDescriptor);
 
+
+                MAIN_DEBUG_LOG();
                 int64_t grab_end = tools_get_time_us();
-
-                const int payload_offset = sizeof(image_frame_header_t);
-                int total_bytes = encoder->encode(
-                    encoder,
-                    &purb->urb_msg[payload_offset],
-                    fb_buf,
-                    0, 0,
-                    frameDescriptor.Width - 1,
-                    frameDescriptor.Height - 1,
-                    frameDescriptor.Width,
-                    pContext->display_config.blimit);
-
-                int64_t encode_end = tools_get_time_us();
-
-                encoder->encode_header(encoder, purb->urb_msg, 0, 0, frameDescriptor.Width - 1, frameDescriptor.Height - 1, total_bytes);
-                total_bytes += sizeof(image_frame_header_t);
-
-                LOGD("Sending URB id:%d, size:%d bytes\n", purb->id, total_bytes);
-                NTSTATUS ret = usb_send_msg_async(purb, pContext->BulkWritePipe, purb->Request, purb->urb_msg, total_bytes);
-
+                int total_bytes =m_pEncoder->encode(purb->urb_msg,fb_buf,purb->urb_msg_size,0,0,frameDescriptor.Width,frameDescriptor.Height);
                 if (total_bytes % pContext->max_out_pkg_size == 0) {
-                    PSLIST_ENTRY zlp_entry = InterlockedPopEntrySList(&urb_list);
-                    urb_item_t* zlp_urb = (urb_item_t*)zlp_entry;
+                    total_bytes +=m_pEncoder->encode(purb->urb_msg,nullptr,purb->urb_msg_size,0,0,0,0);
+                }
 
-                    if (zlp_urb != NULL) {
-                        image_setup_frame_header(zlp_urb->urb_msg, 0xff, 0, 0);
-                        usb_send_msg_async(zlp_urb, pContext->BulkWritePipe, zlp_urb->Request, zlp_urb->urb_msg, sizeof(image_frame_header_t));
-                        LOGD("Sent ZLP for URB id:%d (ep_size:%d)\n", zlp_urb->id, pContext->max_out_pkg_size);
-                    } else {
-                        LOGW("No URB available for ZLP\n");
-                    }
+
+                MAIN_DEBUG_LOG();
+                int64_t encode_end = tools_get_time_us();
+                NTSTATUS ret = usb_send_data_async(purb, pContext->BulkWritePipe, total_bytes);
+                if (!NT_SUCCESS(ret)) {
+                    LOGW("USB send failed with status 0x%x, attempting recovery\n", ret);
                 }
 
                 int64_t send_end = tools_get_time_us();
@@ -566,35 +535,29 @@ void SwapChainProcessor::RunCore()
                 const int64_t send_time = send_end - encode_end;
                 const int64_t total_time = send_end - grab_start;
 
-                LOGM("[Frame] id:%d size:%d grab:%lldus encode:%lldus send:%lldus total:%lldus\n",
-                     purb->id, total_bytes, grab_time, encode_time, send_time, total_time);
+                LOGI("[Frame] id:%d size:%d grab:%lldus encode:%lldus send:%lldus total:%lldus\n",purb->id, total_bytes, grab_time, encode_time, send_time, total_time);
 
                 // Update performance statistics
-                tools_perf_stats_update(&pContext->perf_stats, total_bytes,
-                                      grab_time, encode_time, send_time,
-                                      NT_SUCCESS(ret));
+                tools_perf_stats_update(&pContext->perf_stats, total_bytes,grab_time, encode_time, send_time,NT_SUCCESS(ret));
 
                 // Print stats periodically
+                MAIN_DEBUG_LOG();
                 if (pContext->perf_stats.total_frames % stats_print_interval == 0) {
                     tools_perf_stats_print(&pContext->perf_stats);
                 }
-
-                // Error recovery
-                if (!NT_SUCCESS(ret)) {
-                    LOGW("USB send failed with status 0x%x, attempting recovery\n", ret);
-                    NTSTATUS recovery_status = usb_error_recovery(mp_WdfDevice, ret);
-                    if (!NT_SUCCESS(recovery_status)) {
-                        LOGE("USB error recovery failed: 0x%x\n", recovery_status);
-                    }
-                }
-
-                tools_sample_tick(pContext->display_config.fps);
             } else {
                 LOGW("No URB available, frame dropped\n");
                 pContext->perf_stats.dropped_frames++;
             }
-
         next_frame:
+            if(pContext->config.sleep > 0) {
+                LOGW("Sleep %dmS for debug \n",pContext->config.sleep * 100);
+                Sleep(pContext->config.sleep * 100);
+            }
+            else {
+                tools_sample_tick(pContext->config.fps);
+            }
+
             AcquiredBuffer.Reset();
             hr = IddCxSwapChainFinishedProcessingFrame(m_hSwapChain);
             if (FAILED(hr)) {
@@ -606,6 +569,10 @@ void SwapChainProcessor::RunCore()
             LOGE("Swap-chain abandoned, exiting loop: 0x%x\n", hr);
             break;
         }
+#else
+        Sleep(100);
+        LOGE("sleep 5s in cycle\n");
+#endif 
     }
 
     // Print final statistics
@@ -636,49 +603,20 @@ constexpr DISPLAYCONFIG_VIDEO_SIGNAL_INFO dispinfo(UINT32 h, UINT32 v) {
     DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE
     };
 }
+
 // A list of modes exposed by the sample monitor EDID - FOR SAMPLE PURPOSES ONLY
 const DISPLAYCONFIG_VIDEO_SIGNAL_INFO IndirectDeviceContext::s_KnownMonitorModes[] =
 {
-    // 640 x 480 @ 60Hz
-    {
-          25249 * KHZ,                                   // pixel clock rate [Hz]
-        { 25249 * KHZ, 640 + 160 },                      // fractional horizontal refresh rate [Hz]
-        { 25249 * KHZ, (640 + 160) * (480 + 46) },       // fractional vertical refresh rate [Hz]
-        { 640, 480 },                                    // (horizontal, vertical) active pixel resolution
-        { 640 + 160, 480 + 46 },                         // (horizontal, vertical) blanking pixel resolution
-        { { 255, 0 } },                                  // video standard and vsync divider
-        DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE
-    },
-    // 800 x 480 @ 60Hz
-    {
-          29500 * KHZ,                                   // pixel clock rate [Hz] (29.5 MHz)
-        { 29500 * KHZ, 800 + 216 },                      // fractional horizontal refresh rate [Hz]
-        { 29500 * KHZ, (800 + 216) * (480 + 23) },       // fractional vertical refresh rate [Hz]
-        { 800, 480 },                                    // (horizontal, vertical) active pixel resolution
-        { 800 + 216, 480 + 23 },                         // (horizontal, vertical) total pixel resolution
-        { { 255, 0 } },                                  // video standard and vsync divider
-        DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE
-    },
-    // 800 x 600 @ 60Hz
-    {
-          40 * MHZ,                                      // pixel clock rate [Hz]
-        { 40 * MHZ, 800 + 256 },                         // fractional horizontal refresh rate [Hz]
-        { 40 * MHZ, (800 + 256) * (600 + 28) },          // fractional vertical refresh rate [Hz]
-        { 800, 600 },                                    // (horizontal, vertical) active pixel resolution
-        { 800 + 256, 600 + 28 },                         // (horizontal, vertical) total pixel resolution
-        { { 255, 0 }},                                   // video standard and vsync divider
-        DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE
-    },
-    // 1920 x 1280 @ 60Hz
-{
-      40 * MHZ,                                      // pixel clock rate [Hz]
-    { 40 * MHZ, 800 + 256 },                         // fractional horizontal refresh rate [Hz]
-    { 40 * MHZ, (800 + 256) * (600 + 28) },          // fractional vertical refresh rate [Hz]
-    { 1920, 1280 },                                    // (horizontal, vertical) active pixel resolution
-    { 1920 + 256, 1280 + 28 },                         // (horizontal, vertical) total pixel resolution
-    { { 255, 0 }},                                   // video standard and vsync divider
-    DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE
-},
+dispinfo(240, 240),
+dispinfo(280, 240),
+dispinfo(320, 240),
+dispinfo(480, 320),
+dispinfo(480, 480),
+dispinfo(640, 480),
+dispinfo(800, 480),
+dispinfo(800, 600),
+
+dispinfo(1920, 1080),
 dispinfo(1920, 1200),
 dispinfo(1920, 1440),
 dispinfo(2560, 1440),
@@ -786,6 +724,12 @@ void IndirectDeviceContext::InitAdapter()
 
 void IndirectDeviceContext::FinishInit()
 {
+    auto* pDeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(m_WdfDevice);
+    
+    g_maxWidth = pDeviceContext->config.w;
+    g_maxHeight = pDeviceContext->config.h;
+    LOGI("Global resolution limits from USB config: %dx%d\n", g_maxWidth, g_maxHeight);
+
     for (unsigned int i = 0; i < NUM_VIRTUAL_DISPLAYS; i++) {
         CreateMonitor(i);
     }
@@ -913,26 +857,45 @@ NTSTATUS IddSampleParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION
     // this sample driver, we hard-code the EDID, so this function can generate known modes.
     // ==============================
 
-    pOutArgs->MonitorModeBufferOutputCount = ARRAYSIZE(IndirectDeviceContext::s_KnownMonitorModes);
+    // Filter modes based on global configuration limits
+    std::vector<DISPLAYCONFIG_VIDEO_SIGNAL_INFO> filteredModes;
 
-    if (pInArgs->MonitorModeBufferInputCount < ARRAYSIZE(IndirectDeviceContext::s_KnownMonitorModes))
+    for (DWORD i = 0; i < ARRAYSIZE(IndirectDeviceContext::s_KnownMonitorModes); i++)
+    {
+        const auto& mode = IndirectDeviceContext::s_KnownMonitorModes[i];
+        UINT width = mode.activeSize.cx;
+        UINT height = mode.activeSize.cy;
+
+        if (width <= (UINT)g_maxWidth && height <= (UINT)g_maxHeight)
+        {
+            filteredModes.push_back(mode);
+            LOGI("Keeping mode %d: %dx%d\n", i, width, height);
+        }
+        else
+        {
+            LOGI("Skipping mode %d: %dx%d (exceeds max %dx%d)\n", i, width, height, g_maxWidth, g_maxHeight);
+        }
+    }
+
+    pOutArgs->MonitorModeBufferOutputCount = (UINT)filteredModes.size();
+
+    if (pInArgs->MonitorModeBufferInputCount < filteredModes.size())
     {
         // Return success if there was no buffer, since the caller was only asking for a count of modes
         return (pInArgs->MonitorModeBufferInputCount > 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
     }
     else
     {
-        // Copy the known modes to the output buffer
-        for (DWORD ModeIndex = 0; ModeIndex < ARRAYSIZE(IndirectDeviceContext::s_KnownMonitorModes); ModeIndex++)
+        // Copy the filtered modes to the output buffer
+        for (size_t ModeIndex = 0; ModeIndex < filteredModes.size(); ModeIndex++)
         {
             pInArgs->pMonitorModes[ModeIndex].Size = sizeof(IDDCX_MONITOR_MODE);
             pInArgs->pMonitorModes[ModeIndex].Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-            pInArgs->pMonitorModes[ModeIndex].MonitorVideoSignalInfo = IndirectDeviceContext::s_KnownMonitorModes[ModeIndex];
+            pInArgs->pMonitorModes[ModeIndex].MonitorVideoSignalInfo = filteredModes[ModeIndex];
         }
 
-        // Set the preferred mode as represented in the EDID
-        // Mode 1: 800 x 480 @ 60Hz (Index 0 is 640x480, Index 1 is 800x480)
-        pOutArgs->PreferredMonitorModeIdx = 1;
+        // Set the preferred mode (highest resolution in filtered list)
+        pOutArgs->PreferredMonitorModeIdx = (UINT)filteredModes.size() > 0 ? (UINT)filteredModes.size() - 1 : 0;
 
         return STATUS_SUCCESS;
     }
@@ -984,56 +947,58 @@ NTSTATUS IddSampleMonitorQueryModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_
 {
     UNREFERENCED_PARAMETER(MonitorObject);
 
-    vector<IDDCX_TARGET_MODE> TargetModes(34);
+    int i=0;
+    vector<IDDCX_TARGET_MODE> TargetModes(24);
 
     // Create a set of modes supported for frame processing and scan-out. These are typically not based on the
     // monitor's descriptor and instead are based on the static processing capability of the device. The OS will
     // report the available set of modes for a given output as the intersection of monitor modes with target modes.
 
+    CreateTargetMode(TargetModes[i++], 1920, 1080, 60);
+    CreateTargetMode(TargetModes[i++], 1600, 1024, 60);
+    CreateTargetMode(TargetModes[i++], 1680, 1050, 60);
+    CreateTargetMode(TargetModes[i++], 1600, 900, 60);
+    CreateTargetMode(TargetModes[i++], 1440, 900, 60);
+    CreateTargetMode(TargetModes[i++], 1400, 1050, 60);
+    CreateTargetMode(TargetModes[i++], 1366, 768, 60);
+    CreateTargetMode(TargetModes[i++], 1360, 768, 60);
+    CreateTargetMode(TargetModes[i++], 1280, 1024, 60);
+    CreateTargetMode(TargetModes[i++], 1280, 960, 60);
+    CreateTargetMode(TargetModes[i++], 1280, 800, 60);
+    CreateTargetMode(TargetModes[i++], 1280, 768, 60);
+    CreateTargetMode(TargetModes[i++], 1280, 720, 60);
+    CreateTargetMode(TargetModes[i++], 1280, 600, 60);
+    CreateTargetMode(TargetModes[i++], 1152, 864, 60);
+    CreateTargetMode(TargetModes[i++], 1024, 768, 60);
+    CreateTargetMode(TargetModes[i++],240, 240, 60);
+    CreateTargetMode(TargetModes[i++],280, 240, 60);
+    CreateTargetMode(TargetModes[i++],320, 240, 60);
+    CreateTargetMode(TargetModes[i++],480, 320, 60);
+    CreateTargetMode(TargetModes[i++],480, 480, 60);
+    CreateTargetMode(TargetModes[i++],640, 480, 60);
+    CreateTargetMode(TargetModes[i++],800, 480, 60);
+    CreateTargetMode(TargetModes[i++],800, 600, 60);
 
-    CreateTargetMode(TargetModes[0], 7680, 4320, 60);
-    CreateTargetMode(TargetModes[1], 6016, 3384, 60);
-    CreateTargetMode(TargetModes[2], 5120, 2880, 60);
-    CreateTargetMode(TargetModes[3], 4096, 2560, 60);
-    CreateTargetMode(TargetModes[4], 4096, 2304, 60);
-    CreateTargetMode(TargetModes[5], 3840, 2400, 60);
-    CreateTargetMode(TargetModes[6], 3840, 2160, 60);
-    CreateTargetMode(TargetModes[7], 3200, 2400, 60);
-    CreateTargetMode(TargetModes[8], 3200, 1800, 60);
-    CreateTargetMode(TargetModes[9], 3008, 1692, 60);
-    CreateTargetMode(TargetModes[10], 2880, 1800, 60);
-    CreateTargetMode(TargetModes[11], 2880, 1620, 60);
-    CreateTargetMode(TargetModes[12], 2560, 1600, 60);
-    CreateTargetMode(TargetModes[13], 2560, 1440, 60);
-    CreateTargetMode(TargetModes[14], 1920, 1440, 60);
-    CreateTargetMode(TargetModes[15], 1920, 1200, 60);
-
-    CreateTargetMode(TargetModes[16], 1920, 1080, 60);
-    CreateTargetMode(TargetModes[17], 1600, 1024, 60);
-    CreateTargetMode(TargetModes[18], 1680, 1050, 60);
-    CreateTargetMode(TargetModes[19], 1600, 900, 60);
-    CreateTargetMode(TargetModes[20], 1440, 900, 60);
-    CreateTargetMode(TargetModes[21], 1400, 1050, 60);
-    CreateTargetMode(TargetModes[22], 1366, 768, 60);
-    CreateTargetMode(TargetModes[23], 1360, 768, 60);
-    CreateTargetMode(TargetModes[24], 1280, 1024, 60);
-    CreateTargetMode(TargetModes[25], 1280, 960, 60);
-    CreateTargetMode(TargetModes[26], 1280, 800, 60);
-    CreateTargetMode(TargetModes[27], 1280, 768, 60);
-    CreateTargetMode(TargetModes[28], 1280, 720, 60);
-    CreateTargetMode(TargetModes[29], 1280, 600, 60);
-    CreateTargetMode(TargetModes[30], 1152, 864, 60);
-    CreateTargetMode(TargetModes[31], 1024, 768, 60);
-    CreateTargetMode(TargetModes[32], 800, 600, 60);
-    CreateTargetMode(TargetModes[33], 640, 480, 60);
-
-    pOutArgs->TargetModeBufferOutputCount = (UINT)TargetModes.size();
-
-    if (pInArgs->TargetModeBufferInputCount >= TargetModes.size())
+    vector<IDDCX_TARGET_MODE> FilteredModes;
+    for(i = 0; i < TargetModes.size(); i++)
     {
-        copy(TargetModes.begin(), TargetModes.end(), pInArgs->pTargetModes);
+        if (TargetModes[i].TargetVideoSignalInfo.targetVideoSignalInfo.activeSize.cx <= (UINT)g_maxWidth &&
+            TargetModes[i].TargetVideoSignalInfo.targetVideoSignalInfo.activeSize.cy <= (UINT)g_maxHeight)
+        {
+            FilteredModes.push_back(TargetModes[i]);
+            LOGI("Keeping target mode %d: %dx%d\n", i, TargetModes[i].TargetVideoSignalInfo.targetVideoSignalInfo.activeSize.cx, TargetModes[i].TargetVideoSignalInfo.targetVideoSignalInfo.activeSize.cy);
+        }
+        else
+        {
+            LOGI("Skipping target mode %d: %dx%d (exceeds max %dx%d)\n", i, TargetModes[i].TargetVideoSignalInfo.targetVideoSignalInfo.activeSize.cx, TargetModes[i].TargetVideoSignalInfo.targetVideoSignalInfo.activeSize.cy, g_maxWidth, g_maxHeight);
+        }
     }
+    pOutArgs->TargetModeBufferOutputCount = (UINT)FilteredModes.size();
 
+    if (pInArgs->TargetModeBufferInputCount >= FilteredModes.size())
+    {
+        copy(FilteredModes.begin(), FilteredModes.end(), pInArgs->pTargetModes);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -1057,6 +1022,7 @@ NTSTATUS IddSampleMonitorUnassignSwapChain(IDDCX_MONITOR MonitorObject)
 
 #pragma region USB Device PrepareHardware
 
+
 NTSTATUS
 idd_usbdisp_evt_device_prepareHardware(
 	WDFDEVICE Device,
@@ -1074,10 +1040,9 @@ idd_usbdisp_evt_device_prepareHardware(
 	waitWakeEnable = FALSE;
 	PAGED_CODE();
 
-	LOGI("--> EvtDevicePrepareHardware\n");
-
 	if (pDeviceContext->UsbDevice == NULL) {
 #if UMDF_VERSION_MINOR >= 25
+        LOGI("--> EvtDevicePrepareHardware version >=25 \n");
 		WDF_USB_DEVICE_CREATE_CONFIG createParams;
 
 		WDF_USB_DEVICE_CREATE_CONFIG_INIT(&createParams,
@@ -1089,6 +1054,7 @@ idd_usbdisp_evt_device_prepareHardware(
 			WDF_NO_OBJECT_ATTRIBUTES,
 			&pDeviceContext->UsbDevice);
 #else
+        LOGI("--> EvtDevicePrepareHardware 00 \n");
 		status = WdfUsbTargetDeviceCreate(Device,
 			WDF_NO_OBJECT_ATTRIBUTES,
 			&pDeviceContext->UsbDevice);
@@ -1115,19 +1081,10 @@ idd_usbdisp_evt_device_prepareHardware(
 		pDeviceContext->UsbDeviceTraits = 0;
 	}
 
-	status = SelectInterfaces(Device);
-	if (!NT_SUCCESS(status)) {
-		LOGI("SelectInterfaces failed 0x%x\n", status);
-		return status;
-	}
-
-	get_usb_dev_string_info(Device, pDeviceContext->tchar_udisp_devinfo);
+	usb_get_discribe_info(Device, pDeviceContext->tchar_udisp_devinfo);
 	WideCharToMultiByte(CP_ACP,0,pDeviceContext->tchar_udisp_devinfo,-1,pDeviceContext->udisp_dev_info.cstr,UDISP_CONFIG_STR_LEN,NULL,NULL);
 
 	LOGI("<-- EvtDevicePrepareHardware\n");
-
-	// Update USB connection state
-	pDeviceContext->usb_state = USB_STATE_CONNECTED;
 
 	// Parse USB device info to configure IDD parameters
 	if (strlen(pDeviceContext->udisp_dev_info.cstr) > 3) {
@@ -1136,28 +1093,28 @@ idd_usbdisp_evt_device_prepareHardware(
 
 		// Apply parsed configuration
 		if (config.width != 0 && config.height != 0) {
-			pDeviceContext->display_config.w = config.width;
-			pDeviceContext->display_config.h = config.height;
+			pDeviceContext->config.w = config.width;
+			pDeviceContext->config.h = config.height;
 			LOGI("Applied USB config: width=%d, height=%d\n", config.width, config.height);
 		}
-
-		pDeviceContext->display_config.enc = config.enc_type;
-		pDeviceContext->display_config.quality = config.quality;
-		pDeviceContext->display_config.fps = config.fps;
-		pDeviceContext->display_config.blimit = config.blimit;
+        pDeviceContext->config.sleep        = config.sleep;
+        pDeviceContext->config.debug_level  = config.debug;
+		pDeviceContext->config.img_type     = config.img_type;
+		pDeviceContext->config.img_qlt      = config.img_qlt;
+		pDeviceContext->config.fps          = config.fps;
 
 		LOGI("USB device configuration applied:\n");
-		LOGI("  Width: %d\n", pDeviceContext->display_config.w);
-		LOGI("  Height: %d\n", pDeviceContext->display_config.h);
-		LOGI("  Encoder: %d (0=RGB565, 1=RGB888, 3=JPEG)\n", pDeviceContext->display_config.enc);
-		LOGI("  Quality: %d\n", pDeviceContext->display_config.quality);
-		LOGI("  FPS: %d\n", pDeviceContext->display_config.fps);
-		LOGI("  Buffer limit: %d bytes (%.2f MB)\n",
-		      pDeviceContext->display_config.blimit, (float)pDeviceContext->display_config.blimit / (1024 * 1024));
+		LOGI("  Width: %d\n", pDeviceContext->config.w);
+		LOGI("  Height: %d\n", pDeviceContext->config.h);
+		LOGI("  Encoder: %d (0=RGB565, 1=RGB888, 3=JPEG)\n", pDeviceContext->config.img_type);
+		LOGI("  Quality: %d\n", pDeviceContext->config.img_qlt);
+		LOGI("  FPS: %d\n", pDeviceContext->config.fps);
+        LOGI("  Sleep: %d\n", pDeviceContext->config.sleep);
+        LOGI("  Debug level: %d\n", pDeviceContext->config.debug_level);
 	} else {
 		LOGI("USB device info string too short or invalid, using default configuration\n");
 		LOGI("Default config: width=%d, height=%d, enc=%d, fps=%d\n",
-		      pDeviceContext->display_config.w, pDeviceContext->display_config.h, pDeviceContext->display_config.enc, pDeviceContext->display_config.fps);
+		      pDeviceContext->config.w, pDeviceContext->config.h, pDeviceContext->config.img_type, pDeviceContext->config.fps);
 	}
 
 	LOGI("USB device connected successfully\n");
@@ -1190,10 +1147,6 @@ NTSTATUS IddSampleDeviceReleaseHardware(
 	// Handle USB disconnection
 	usb_device_disconnect(Device);
 
-	// Update USB connection state
-	pDeviceContext->usb_state = USB_STATE_DISCONNECTED;
-	LOGI("USB device disconnected\n");
-
 	return STATUS_SUCCESS;
 }
 
@@ -1208,9 +1161,6 @@ VOID IddSampleDeviceSurpriseRemoval(
 
 	// Handle surprise removal
 	usb_device_disconnect(Device);
-
-	// Update USB connection state
-	pDeviceContext->usb_state = USB_STATE_DISCONNECTED;
 
 	// Print performance statistics
 	tools_perf_stats_print(&pDeviceContext->perf_stats);

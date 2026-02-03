@@ -38,14 +38,14 @@
     <ClCompile Include="Driver.cpp" />
     <ClCompile Include="usb_driver.cpp" />
     <ClCompile Include="tools.c" />
-    <ClCompile Include="image_encoder.c" />
+    <ClCompile Include="encoder.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Driver.h" />
     <ClInclude Include="Trace.h" />
     <ClInclude Include="basetype.h" />
     <ClInclude Include="usb_driver.h" />
-    <ClInclude Include="image_encoder.h" />
+    <ClInclude Include="encoder.h" />
     <ClInclude Include="tools.h" />
   </ItemGroup>
   <ItemGroup>
@@ -125,6 +125,7 @@
     <IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>
     <IDDCX_VERSION_MINOR>0</IDDCX_VERSION_MINOR>
     <Driver_SpectreMitigation>Spectre</Driver_SpectreMitigation>
+    <UMDF_VERSION_MINOR>25</UMDF_VERSION_MINOR>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion>
@@ -242,6 +243,7 @@
       <EnablePREfast>true</EnablePREfast>
       <AdditionalIncludeDirectories>$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);OneCoreUAP.lib;avrt.lib;jpeg-static.lib</AdditionalDependencies>

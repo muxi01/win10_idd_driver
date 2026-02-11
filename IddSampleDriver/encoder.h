@@ -10,8 +10,6 @@
 #define PACK(__Declaration__) __pragma(pack(push, 1)) __Declaration__ __pragma(pack(pop))
 #endif
 
-#define cpu_to_le32(x)  (uint32_t)(x)
-
 #define FB_DISP_DEFAULT_PIXEL_BITS  32
 
 typedef struct _image_frame_header_t {
@@ -19,6 +17,9 @@ typedef struct _image_frame_header_t {
     _u32 img_type;
     _u32 img_len;
     _u32 img_cnt;
+    _u16 img_x,img_y;
+    _u16 img_w,img_h;
+    _u32 reserved[2];
 } image_frame_header_t;
 
 
@@ -35,8 +36,6 @@ struct jpeg_error_mgr_with_exit_t {
 struct jpeg_encoder_private_t {
     struct jpeg_compress_struct cinfo;
     jpeg_error_mgr_with_exit_t jerr;
-    uint8_t* row_buffer;
-    int buffer_size;
 };
 
 

@@ -428,7 +428,7 @@ void SwapChainProcessor::Run()
 }
 
 
-#define MAIN_DEBUG_LOG()  LOGI("%s.%d\n",__func__,__LINE__)
+#define MAIN_DEBUG_LOG()  // LOGI("%s.%d\n",__func__,__LINE__)
 void SwapChainProcessor::main_function()
 {
     ComPtr<IDXGIDevice> DxgiDevice;
@@ -525,8 +525,11 @@ void SwapChainProcessor::main_function()
                 MAIN_DEBUG_LOG();
                 int64_t encode_end = tools_get_time_us();
                 NTSTATUS ret = usb_send_data_async(purb, pContext->BulkWritePipe, total_bytes);
+                // NTSTATUS ret = usb_send_data_sync(purb, pContext->BulkWritePipe, total_bytes);
                 if (!NT_SUCCESS(ret)) {
-                    LOGW("USB send failed with status 0x%x, attempting recovery\n", ret);
+                    LOGW("1.USB send failed with status 0x%x, attempting recovery, URB id=%d\n", ret, purb->id);
+                    // 发送失败时直接将URB推回list，completion routine不会被调用
+                    InterlockedPushEntrySList(&urb_list, &(purb->node));
                 }
 
                 int64_t send_end = tools_get_time_us();
@@ -1142,11 +1145,10 @@ NTSTATUS IddSampleDeviceReleaseHardware(
 	UNREFERENCED_PARAMETER(ResourceListTranslated);
 	auto* pDeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
 
-	LOGI("IddSampleDeviceReleaseHardware called\n");
-
 	// Handle USB disconnection
 	usb_device_disconnect(Device);
 
+    LOGI("IddSampleDeviceReleaseHardware called\n");
 	return STATUS_SUCCESS;
 }
 
@@ -1157,13 +1159,8 @@ VOID IddSampleDeviceSurpriseRemoval(
 {
 	auto* pDeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
 
-	LOGW("!!! USB device surprise removal detected !!!\n");
-
 	// Handle surprise removal
 	usb_device_disconnect(Device);
-
-	// Print performance statistics
-	tools_perf_stats_print(&pDeviceContext->perf_stats);
 
 	LOGW("USB device surprise removal handled\n");
 }

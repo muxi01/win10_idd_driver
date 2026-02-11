@@ -12,7 +12,7 @@ static usb_connection_state_t g_usb_state = USB_STATE_DISCONNECTED;
 static volatile LONG g_usb_init_flag = 0;
 static WDFWAITLOCK g_usb_state_lock = NULL;
 
-#define LOG_DEBUG()  LOGI("%s.%d\n",__func__,__LINE__)
+#define LOG_DEBUG() // LOGI("%s.%d\n",__func__,__LINE__)
 
 
 static VOID EvtRequestWriteCompletionRoutine(
@@ -34,9 +34,23 @@ static VOID EvtRequestWriteCompletionRoutine(
     bytesWritten = usbCompletionParams->Parameters.PipeWrite.Length;
 
     if (!NT_SUCCESS(status)) {
-        LOGE("Write failed: request Status 0x%x UsbdStatus 0x%x\n",
-             status, usbCompletionParams->UsbdStatus);
+        // 检查是否为超时或取消错误
+        if (status == STATUS_CANCELLED) {
+            LOGE("Write request CANCELLED (timeout?): request Status 0x%x UsbdStatus 0x%x, URB id=%d, timeout=%dms, bytesWritten=%d\n",
+                 status, usbCompletionParams->UsbdStatus, urb->id, USB_SEND_TIMEOUT_MS, bytesWritten);
+        } else if (status == STATUS_IO_TIMEOUT) {
+            LOGE("Write request TIMEOUT: request Status 0x%x UsbdStatus 0x%x, URB id=%d, timeout=%dms\n",
+                 status, usbCompletionParams->UsbdStatus, urb->id, USB_SEND_TIMEOUT_MS);
+        } else {
+            LOGE("Write failed: request Status 0x%x UsbdStatus 0x%x, URB id=%d, bytesWritten=%d\n",
+                 status, usbCompletionParams->UsbdStatus, urb->id, bytesWritten);
+        }
     }
+
+    if (NULL != urb->wdfMemory) {
+		WdfObjectDelete(urb->wdfMemory);
+		urb->wdfMemory = NULL;
+	}
 
     InterlockedPushEntrySList(urb->urb_list, &(urb->node));
     LOGI("insert URB id=%d to list, bytesWritten=%d\n", urb->id, bytesWritten);
@@ -45,30 +59,56 @@ static VOID EvtRequestWriteCompletionRoutine(
 NTSTATUS usb_send_data_async(urb_item_t* urb, WDFUSBPIPE pipe, int tsize)
 {
     NTSTATUS status;
+    WDFMEMORY  wdfMemory;
     WDFREQUEST Request = urb->Request;
     PUCHAR msg = urb->urb_msg;
+    WDF_USB_PIPE_INFORMATION pipeInfo;
+    WDF_REQUEST_SEND_OPTIONS sendOptions;
 
-    // Validate buffer size
-    if (urb->wdfMemory == NULL) {
-        LOGE("URB wdfMemory is NULL for URB id=%d\n", urb->id);
-        return STATUS_INVALID_DEVICE_STATE;
-    }
 
     if (tsize > urb->urb_msg_size) {
         LOGE("Transfer size %d exceeds buffer size %d for URB id=%d\n",tsize, urb->urb_msg_size, urb->id);
         return STATUS_BUFFER_TOO_SMALL;
     }
 
+    status = WdfMemoryCreate(WDF_NO_OBJECT_ATTRIBUTES,NonPagedPool,0,tsize,&wdfMemory,NULL);
+	if (!NT_SUCCESS(status)) {
+		LOGE("WdfMemoryCreate NG %x\n",status);
+		return status;
+	}
+
+    urb->wdfMemory=wdfMemory;
+#if 0
+    // 检查管道方向: 必须是OUT管道(写管道)
+    if (WdfUsbTargetPipeIsInEndpoint(pipe)) {
+        LOGE("Cannot use IN pipe (read pipe) for data send, URB id=%d\n", urb->id);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // 获取管道信息进行验证
+    WDF_USB_PIPE_INFORMATION_INIT(&pipeInfo);
+    WdfUsbTargetPipeGetInformation(pipe, &pipeInfo);
+
+    if (pipeInfo.PipeType != WdfUsbPipeTypeBulk) {
+        LOGE("Pipe type %d is not supported, only Bulk pipe is supported, URB id=%d\n",pipeInfo.PipeType, urb->id);
+        return STATUS_INVALID_PARAMETER;
+    }
+#endif
+
     LOG_DEBUG();
     // Copy to pre-allocated WDF memory
-    WdfMemoryCopyFromBuffer(urb->wdfMemory, 0, msg, tsize);
+    WdfMemoryCopyFromBuffer(wdfMemory, 0, msg, tsize);
 
-    // Reuse and initialize the request before formatting
-    // WdfRequestReuse(Request, STATUS_SUCCESS);
+    WDF_REQUEST_REUSE_PARAMS params;
+    WDF_REQUEST_REUSE_PARAMS_INIT(&params, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_SUCCESS);
+    status = WdfRequestReuse(Request, &params);
+    if (!NT_SUCCESS(status)) {
+        LOGE("WdfRequestReuse failed: 0x%x, URB id=%d\n", status, urb->id);
+    }
 
     // Format request for write
     LOG_DEBUG();
-    status = WdfUsbTargetPipeFormatRequestForWrite(pipe, Request, urb->wdfMemory, NULL);
+    status = WdfUsbTargetPipeFormatRequestForWrite(pipe, Request,wdfMemory, NULL);
     if (!NT_SUCCESS(status)) {
         LOGE("WdfUsbTargetPipeFormatRequestForWrite failed: 0x%x\n", status);
         return status;
@@ -78,16 +118,95 @@ NTSTATUS usb_send_data_async(urb_item_t* urb, WDFUSBPIPE pipe, int tsize)
     LOG_DEBUG();
     WdfRequestSetCompletionRoutine(Request, EvtRequestWriteCompletionRoutine, urb);
 
+    // 设置超时选项
+    WDF_REQUEST_SEND_OPTIONS_INIT(&sendOptions, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&sendOptions, USB_SEND_TIMEOUT_MS);
+
     LOG_DEBUG();
-    if (!WdfRequestSend(Request, WdfUsbTargetPipeGetIoTarget(pipe), WDF_NO_SEND_OPTIONS)) {
-        status = WdfRequestGetStatus(Request);
+    if (!WdfRequestSend(Request, WdfUsbTargetPipeGetIoTarget(pipe), &sendOptions)) {
+        WdfRequestGetStatus(Request);
         LOGE("WdfRequestSend failed: 0x%x, URB id=%d\n", status, urb->id);
         return status;
     }
 
-    LOGI("usb_send_data_async: Request sent successfully, URB id=%d\n", urb->id);
+    LOGI("usb_send_data_async: Request sent successfully, URB id=%d, timeout=%dms ..... \n", urb->id, USB_SEND_TIMEOUT_MS);
     return STATUS_SUCCESS;
 }
+
+
+
+NTSTATUS usb_send_data_sync(urb_item_t* urb, WDFUSBPIPE pipe, int tsize)
+{
+    NTSTATUS status;
+    WDF_MEMORY_DESCRIPTOR memDesc;
+    ULONG bytesWritten = 0;
+    WDF_USB_PIPE_INFORMATION pipeInfo;
+    WDF_REQUEST_SEND_OPTIONS sendOptions;
+
+    // Validate buffer size
+    if (urb->wdfMemory == NULL) {
+        LOGE("URB wdfMemory is NULL for URB id=%d\n", urb->id);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    if (tsize > urb->urb_msg_size) {
+        LOGE("Transfer size %d exceeds buffer size %d for URB id=%d\n", tsize, urb->urb_msg_size, urb->id);
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+#if 1
+    // 检查管道方向: 必须是OUT管道(写管道)
+    if (WdfUsbTargetPipeIsInEndpoint(pipe)) {
+        LOGE("Cannot use IN pipe (read pipe) for data send, URB id=%d\n", urb->id);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // 获取管道信息进行验证
+    WDF_USB_PIPE_INFORMATION_INIT(&pipeInfo);
+    WdfUsbTargetPipeGetInformation(pipe, &pipeInfo);
+
+    if (pipeInfo.PipeType != WdfUsbPipeTypeBulk) {
+        LOGE("Pipe type %d is not supported, only Bulk pipe is supported, URB id=%d\n", pipeInfo.PipeType, urb->id);
+        return STATUS_INVALID_PARAMETER;
+    }
+#endif
+
+    tsize =16;
+    // Copy data to wdfMemory
+    WdfMemoryCopyFromBuffer(urb->wdfMemory, 0, urb->urb_msg, tsize);
+
+    // Initialize memory descriptor
+    WDF_MEMORY_DESCRIPTOR_INIT_HANDLE(&memDesc, urb->wdfMemory, NULL);
+
+    // Set timeout options
+    WDF_REQUEST_SEND_OPTIONS_INIT(&sendOptions, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&sendOptions, USB_SEND_TIMEOUT_MS);
+
+    // Log before sending
+    LOGI("About to send sync: URB id=%d, size=%d bytes, pipe max_packet=%d\n",urb->id, tsize, pipeInfo.MaximumPacketSize);
+
+    // Send synchronously
+    status = WdfUsbTargetPipeWriteSynchronously(
+        pipe,
+        NULL,              // Use internal request
+        &sendOptions,
+        &memDesc,
+        &bytesWritten
+    );
+
+    if (!NT_SUCCESS(status)) {
+        LOGE("Sync write failed: 0x%x, URB id=%d, size=%d, bytesWritten=%d\n",status, urb->id, tsize, bytesWritten);
+    } else {
+        LOGI("Sync write success: URB id=%d, size=%d, bytesWritten=%d\n",urb->id, tsize, bytesWritten);
+    }
+
+    // Return URB to list (sync send doesn't use completion routine)
+    InterlockedPushEntrySList(urb->urb_list, &(urb->node));
+    LOGI("URB id=%d returned to list\n", urb->id);
+
+    return status;
+}
+
 
 NTSTATUS usb_get_discribe_info(WDFDEVICE Device, TCHAR* stringBuf)
 {
@@ -261,14 +380,6 @@ int usb_resouce_init(SLIST_HEADER* urb_list, int width, int height)
             return -4;
         }
         purb->urb_msg_size = max_transfer_size;
-
-        // Create pre-allocated WDF memory for USB transfer
-        status = WdfMemoryCreate(WDF_NO_OBJECT_ATTRIBUTES,NonPagedPool,0,max_transfer_size,&purb->wdfMemory,NULL);
-        if (!NT_SUCCESS(status)) {
-            LOGE("WdfMemoryCreate failed for URB %d: 0x%x\n", purb->id, status);
-            return -5;
-        }
-
         InterlockedPushEntrySList(urb_list, &(purb->node));
         LOGD("Created URB item %d: urb_msg=%p, size=%d, wdfMemory=%p\n",purb->id, purb->urb_msg, purb->urb_msg_size, purb->wdfMemory);
     }
@@ -291,20 +402,14 @@ int usb_resouce_distory(SLIST_HEADER* urb_list)
 
         LOGD("Cleaning up URB item id:%d\n", purb->id);
 
+        if (purb->Request != NULL) {
+            WdfObjectDelete(purb->Request);
+        }
+
         // Free dynamically allocated urb_msg buffer
         if (purb->urb_msg != NULL) {
             _aligned_free(purb->urb_msg);
             purb->urb_msg = NULL;
-        }
-
-        // Delete pre-allocated WDF memory
-        if (purb->wdfMemory != NULL) {
-            WdfObjectDelete(purb->wdfMemory);
-            purb->wdfMemory = NULL;
-        }
-
-        if (purb->Request != NULL) {
-            WdfObjectDelete(purb->Request);
         }
         _aligned_free(purb);
     }
@@ -353,7 +458,6 @@ BOOLEAN usb_is_connected(WDFDEVICE Device)
         WdfWaitLockAcquire(g_usb_state_lock, NULL);
         state = g_usb_state;
         WdfWaitLockRelease(g_usb_state_lock);
-        LOGI("usb state (0=connected 1=disconnected) %d\n",state);
     }
     return (state == USB_STATE_CONNECTED);
 }

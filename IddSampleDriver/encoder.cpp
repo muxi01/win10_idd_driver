@@ -77,16 +77,6 @@ void ImageEncoder::create_jpeg_encoder()
         return;
     }
 
-    // Initialize row buffer with default size (assume max 1920 width)
-    m_jpeg_private->buffer_size = 1920 * 3;
-    m_jpeg_private->row_buffer = (uint8_t*)malloc(m_jpeg_private->buffer_size);
-    if (m_jpeg_private->row_buffer == nullptr) {
-        LOGE("Failed to allocate JPEG row buffer\n");
-        delete m_jpeg_private;
-        m_jpeg_private = nullptr;
-        return;
-    }
-
     // Setup error handling
     m_jpeg_private->cinfo.err = jpeg_std_error(&m_jpeg_private->jerr.pub);
     m_jpeg_private->jerr.pub.error_exit = &jpeg_error_exit;
@@ -105,10 +95,6 @@ void ImageEncoder::destroy_jpeg_encoder()
         // Cleanup JPEG compression object
         jpeg_destroy_compress(&priv->cinfo);
 
-        // Free row buffer
-        if (priv->row_buffer != nullptr) {
-            free(priv->row_buffer);
-        }
 
         // Free private structure
         delete priv;
@@ -125,28 +111,19 @@ int ImageEncoder::encode_jpeg(uint8_t* output, const uint8_t* input,int buffer_s
         return 0;
     }
 
+    int pixel_bytes=4;
+
     jpeg_encoder_private_t* priv = m_jpeg_private;
     struct jpeg_compress_struct* cinfo = &priv->cinfo;
     JSAMPROW row_ptr[1];
 
-    // Check if we need to resize row buffer
-    const int required_buffer_size = width * 3;
-    if (required_buffer_size > priv->buffer_size) {
-        free(priv->row_buffer);
-        priv->row_buffer = (uint8_t*)malloc(required_buffer_size);
-        if (priv->row_buffer == nullptr) {
-            LOGE("Failed to resize JPEG row buffer to %d\n", required_buffer_size);
-            return 0;
-        }
-        priv->buffer_size = required_buffer_size;
-    }
     jpeg_abort_compress(cinfo);
 
     // Setup JPEG compression parameters
     cinfo->image_width = width;
     cinfo->image_height = height;
-    cinfo->input_components = 3;
-    cinfo->in_color_space = JCS_RGB;
+    cinfo->input_components = pixel_bytes;
+    cinfo->in_color_space = JCS_EXT_BGRX;
     jpeg_set_defaults(cinfo);
     jpeg_set_quality(cinfo, m_quality, TRUE);
 
@@ -158,19 +135,9 @@ int ImageEncoder::encode_jpeg(uint8_t* output, const uint8_t* input,int buffer_s
     jpeg_start_compress(cinfo, TRUE);
 
     // Process each row
-    const uint32_t* framebuffer = (const uint32_t*)input;
-
+    int row_size =width * pixel_bytes;
     for (int row = 0; row < height; row++) {
-        // Convert RGBA to RGB
-        for (int col = 0; col < width; col++) {
-            uint32_t pixel = *framebuffer++;
-            uint8_t* out_pixel = &priv->row_buffer[col * 3];
-            out_pixel[0] = (pixel >> 16) & 0xFF;  // R
-            out_pixel[1] = (pixel >> 8) & 0xFF;   // G
-            out_pixel[2] = pixel & 0xFF;          // B
-        }
-
-        row_ptr[0] = priv->row_buffer;
+        row_ptr[0] = (JSAMPROW)(&input[row_size * row]);
         jpeg_write_scanlines(cinfo, row_ptr, 1);
     }
 
@@ -215,22 +182,31 @@ int ImageEncoder::encode(uint8_t* output, const uint8_t* input,int buffer_size, 
     if((width > 0) && (height > 0)) {
         if (m_type == IMAGE_TYPE_RGB565) {
             image_size = encode_rgb565(buffer_body, input, buffer_size, x, y, width, height);
+            LOGD("encode_rgb565 ...size:%d\n",image_size);
         }
         else if (m_type == IMAGE_TYPE_RGB888) {
             image_size = encode_rgb888(buffer_body, input, buffer_size, x, y, width, height);
+            LOGD("encode_rgb888 ...size:%d\n",image_size);
         }
         else  { //IMAGE_TYPE_JPG
             image_size = encode_jpeg(buffer_body, input, buffer_size, x, y, width, height);
+            LOGD("encode_jpeg ...size:%d\n",image_size);
         }
     }
-    header->magic_id = cpu_to_le32(FRAME_MAGIC_ID);
-    header->img_type = cpu_to_le32(m_type);
-    header->img_len = cpu_to_le32(image_size);
-    header->img_cnt = cpu_to_le32(m_counter);
+    header->magic_id = (FRAME_MAGIC_ID);
+    header->img_type = (m_type);
+    header->img_len = (image_size);
+    header->img_cnt = (m_counter);
+    header->img_x = (x);
+    header->img_y = (y);
+    header->img_w = (width);
+    header->img_h = (height);
+    header->reserved[0] =0X12345678;
+    header->reserved[1] =0X87654321;
     m_counter++;
 
     total_size = image_size + sizeof(image_frame_header_t);
-    total_size = (total_size + 7ul) & (~7ul);
+    total_size = (total_size + 31ul) & (~31ul);
 
     return total_size;
 }

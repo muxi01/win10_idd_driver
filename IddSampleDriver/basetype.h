@@ -21,13 +21,12 @@ typedef uint32_t pixel_type_t;
 #define STATS_PRINT_INTERVAL  100
 
 // Default encoder type
-#define IMAGE_TYPE_RGB565  (('R' << 24) | ('G' << 16) | ('B' << 8) | (16 << 0))
-#define IMAGE_TYPE_RGB888  (('R' << 24) | ('G' << 16) | ('B' << 8) | (24 << 0))
-#define IMAGE_TYPE_YUV420  (('Y' << 24) | ('4' << 16) | ('2' << 8) | ('0' << 0))
-#define IMAGE_TYPE_JPG     (('J' << 24) | ('P' << 16) | ('E' << 8) | ('G' << 0))
-#define IMAGE_TYPE_NULL    (('N' << 24) | ('U' << 16) | ('L' << 8) | ('L' << 0))
-
-#define FRAME_MAGIC_ID     (('l' << 24) | ('v' << 16) | ('s' << 8) | ('n' << 0))
+#define IMAGE_TYPE_RGB565  (('R' << 0) | ('G' << 8) | ('B' << 16) | ('6' << 24))
+#define IMAGE_TYPE_RGB888  (('R' << 0) | ('G' << 8) | ('B' << 16) | ('8' << 24))
+#define IMAGE_TYPE_YUV420  (('Y' << 0) | ('4' << 8) | ('2' << 16) | ('0' << 24))
+#define IMAGE_TYPE_JPG     (('J' << 0) | ('P' << 8) | ('E' << 16) | ('G' << 24))
+#define IMAGE_TYPE_NULL    (('N' << 0) | ('U' << 8) | ('L' << 16) | ('L' << 24))
+#define FRAME_MAGIC_ID     (('l' << 0) | ('v' << 8) | ('s' << 16) | ('n' << 24))
 
 // USB device connection state
 typedef enum _usb_connection_state {
